@@ -27,16 +27,6 @@ static constexpr bool SMOOTH_OUTPUT_POWER = true;
 static constexpr uint8_t POWER_SMOOTHING_SHIFT = 2;
 static constexpr unsigned long POWER_STALE_TIMEOUT_MS = 1500;
 
-// Fixed flat-road model for consistent indoor distance estimates.
-static constexpr float VIRTUAL_TOTAL_MASS_KG = 75.0f;
-static constexpr float VIRTUAL_CDA = 0.35f;
-static constexpr float VIRTUAL_CRR = 0.004f;
-static constexpr float VIRTUAL_DRIVETRAIN_EFFICIENCY = 0.97f;
-static constexpr float VIRTUAL_AIR_DENSITY_KG_M3 = 1.225f;
-static constexpr float VIRTUAL_GRAVITY_M_S2 = 9.80665f;
-static constexpr float VIRTUAL_WHEEL_CIRCUMFERENCE_M = 2.105f;
-static constexpr int16_t VIRTUAL_STOP_POWER_W = 15;
-
 // =====================================================
 // ADVANCED BLE SETTINGS
 // =====================================================

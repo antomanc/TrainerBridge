@@ -14,8 +14,7 @@
  *
  * Garmin receives:
  *   - Cycling Power Measurement 0x2A63
- *   - Power and virtual wheel revolutions
- *   - No cadence
+ *   - Measured power only
  *
  * App receives:
  *   - FTMS Indoor Bike Data 0x2AD2
@@ -100,14 +99,7 @@ static int16_t outputPowerW = 0;
 static float powerScale = DEFAULT_POWER_SCALE;
 static int32_t smoothedOutputPowerQ8 = 0;
 static bool hasSmoothedOutputPower = false;
-static uint16_t realSpeedRaw = 0; // 0.01 km/h
 static int16_t realResistance = 0;
-
-static float virtualSpeedMps = 0.0f;
-static float virtualWheelRemainder = 0.0f;
-static uint32_t virtualCumulativeWheelRevs = 0;
-static uint16_t virtualLastWheelEventTime = 0;
-static unsigned long lastVirtualWheelUpdateAt = 0;
 
 static uint32_t packetsFromTrainer = 0;
 static uint32_t packetsToGarmin = 0;
@@ -186,14 +178,6 @@ static void writeU16(uint8_t *data, size_t index, uint16_t value)
 {
   data[index] = value & 0xff;
   data[index + 1] = (value >> 8) & 0xff;
-}
-
-static void writeU32(uint8_t *data, size_t index, uint32_t value)
-{
-  data[index] = value & 0xff;
-  data[index + 1] = (value >> 8) & 0xff;
-  data[index + 2] = (value >> 16) & 0xff;
-  data[index + 3] = (value >> 24) & 0xff;
 }
 
 static void printBytes(const char *label, const uint8_t *data, size_t len)
@@ -275,73 +259,6 @@ static int16_t getOutputPowerW()
   return (int16_t)((smoothedOutputPowerQ8 + 128) >> 8);
 }
 
-static float getVirtualSpeedMps(int16_t watts)
-{
-  if (watts <= VIRTUAL_STOP_POWER_W) return 0.0f;
-
-  const float aerodynamicFactor = 0.5f * VIRTUAL_AIR_DENSITY_KG_M3 * VIRTUAL_CDA;
-  const float rollingForce = VIRTUAL_CRR * VIRTUAL_TOTAL_MASS_KG * VIRTUAL_GRAVITY_M_S2;
-  const float wheelPower = watts * VIRTUAL_DRIVETRAIN_EFFICIENCY;
-  float speed = 8.0f;
-
-  for (uint8_t i = 0; i < 6; i++)
-  {
-    float speedSquared = speed * speed;
-    float error = aerodynamicFactor * speedSquared * speed + rollingForce * speed - wheelPower;
-    float derivative = 3.0f * aerodynamicFactor * speedSquared + rollingForce;
-
-    speed -= error / derivative;
-  }
-
-  return speed > 0.0f ? speed : 0.0f;
-}
-
-static void updateVirtualWheel(int16_t watts, unsigned long now)
-{
-  if (lastVirtualWheelUpdateAt != 0 && virtualSpeedMps > 0.0f)
-  {
-    unsigned long elapsedMs = now - lastVirtualWheelUpdateAt;
-
-    virtualWheelRemainder +=
-      virtualSpeedMps * (elapsedMs / 1000.0f) / VIRTUAL_WHEEL_CIRCUMFERENCE_M;
-
-    uint32_t completedRevolutions = (uint32_t)virtualWheelRemainder;
-
-    if (completedRevolutions > 0)
-    {
-      virtualCumulativeWheelRevs += completedRevolutions;
-      virtualWheelRemainder -= completedRevolutions;
-
-      unsigned long msSinceLastRevolution = (unsigned long)(
-        virtualWheelRemainder * VIRTUAL_WHEEL_CIRCUMFERENCE_M /
-        virtualSpeedMps * 1000.0f
-      );
-
-      virtualLastWheelEventTime = (uint16_t)(
-        ((uint64_t)(now - msSinceLastRevolution) * 2048ULL) / 1000ULL
-      );
-    }
-  }
-
-  virtualSpeedMps = getVirtualSpeedMps(watts);
-  lastVirtualWheelUpdateAt = now;
-}
-
-static void stopVirtualWheel(unsigned long now)
-{
-  virtualSpeedMps = 0.0f;
-  lastVirtualWheelUpdateAt = now;
-}
-
-static bool virtualSpeedModelSelfCheck()
-{
-  float speedAt150Kmh = getVirtualSpeedMps(150) * 3.6f;
-
-  return getVirtualSpeedMps(0) == 0.0f &&
-         speedAt150Kmh >= 29.5f &&
-         speedAt150Kmh <= 30.0f;
-}
-
 // =====================================================
 // ADVERTISING
 // =====================================================
@@ -377,15 +294,11 @@ static void notifyGarminCyclingPower()
 {
   if (virtualCpsMeasurementChr == nullptr) return;
 
-  // Cycling Power Measurement 0x2A63:
-  // flags 0x0010 = Instantaneous Power + Wheel Revolution Data.
-  // No cadence.
-  uint8_t cp[10];
+  // Cycling Power Measurement 0x2A63: instantaneous power only.
+  uint8_t cp[4];
 
-  writeU16(cp, 0, 0x0010);
+  writeU16(cp, 0, 0x0000);
   writeS16(cp, 2, outputPowerW);
-  writeU32(cp, 4, virtualCumulativeWheelRevs);
-  writeU16(cp, 8, virtualLastWheelEventTime);
 
   virtualCpsMeasurementChr->setValue(cp, sizeof(cp));
   virtualCpsMeasurementChr->notify();
@@ -398,15 +311,11 @@ static void notifyAppIndoorBikeData()
   if (virtualIndoorBikeDataChr == nullptr) return;
 
   // Indoor Bike Data 0x2AD2.
-  // flags 0x0040:
-  // - bit 0 = 0 -> instantaneous speed present
-  // - bit 6 = 1 -> instantaneous power present
-  // No cadence.
-  uint8_t ftms[6];
+  // flags 0x0041: More Data + instantaneous power present.
+  uint8_t ftms[4];
 
-  writeU16(ftms, 0, 0x0040);
-  writeU16(ftms, 2, realSpeedRaw);
-  writeS16(ftms, 4, outputPowerW);
+  writeU16(ftms, 0, 0x0041);
+  writeS16(ftms, 2, outputPowerW);
 
   virtualIndoorBikeDataChr->setValue(ftms, sizeof(ftms));
   virtualIndoorBikeDataChr->notify();
@@ -417,7 +326,6 @@ static void notifyAppIndoorBikeData()
 static void notifyBothImmediately()
 {
   outputPowerW = getOutputPowerW();
-  updateVirtualWheel(outputPowerW, millis());
 
   notifyGarminCyclingPower();
   notifyAppIndoorBikeData();
@@ -486,18 +394,15 @@ static bool parseRealIndoorBikeData(const uint8_t *pData, size_t length)
 
   uint16_t flags = readU16(pData, 0);
   size_t index = 2;
-  uint16_t parsedSpeedRaw = realSpeedRaw;
   int16_t parsedResistance = realResistance;
   int16_t parsedPowerW = realPowerW;
   bool powerPresent = false;
 
-  bool speedPresent = ((flags & 0x0001) == 0);
-
-  if (speedPresent)
+  // Skip the mandatory first field when the More Data flag is clear.
+  if ((flags & 0x0001) == 0)
   {
     if (index + 2 > length) return false;
 
-    parsedSpeedRaw = readU16(pData, index);
     index += 2;
   }
 
@@ -543,7 +448,6 @@ static bool parseRealIndoorBikeData(const uint8_t *pData, size_t length)
 
   if (!powerPresent) return false;
 
-  realSpeedRaw = parsedSpeedRaw;
   realResistance = parsedResistance;
   realPowerW = parsedPowerW;
 
@@ -873,10 +777,8 @@ class RealClientCallbacks : public NimBLEClientCallbacks
     hasSmoothedOutputPower = false;
     realPowerW = 0;
     outputPowerW = 0;
-    realSpeedRaw = 0;
     realResistance = 0;
     lastTrainerPacketAt = 0;
-    stopVirtualWheel(millis());
 
     stopProxyAdvertising();
 
@@ -1172,18 +1074,16 @@ static void setupCyclingPowerService()
 
   virtualCpsMeasurementChr->setCallbacks(&genericCallbacks);
 
-  // Wheel Revolution Data supported; not a distributed power sensor.
-  uint8_t cpFeature[4];
-  writeU32(cpFeature, 0, 0x00100004);
+  // No optional Cycling Power Measurement fields are supported.
+  uint8_t cpFeature[4] = {0};
   virtualCpsFeatureChr->setValue(cpFeature, sizeof(cpFeature));
 
   // Sensor location.
   uint8_t sensorLocation[1] = {0x0D};
   virtualCpsSensorLocationChr->setValue(sensorLocation, sizeof(sensorLocation));
 
-  // Initial measurement: wheel data present, all values at zero.
-  uint8_t cpInitial[10] = {0};
-  writeU16(cpInitial, 0, 0x0010);
+  // Initial measurement: flags 0, instantaneous power 0.
+  uint8_t cpInitial[4] = {0};
   virtualCpsMeasurementChr->setValue(cpInitial, sizeof(cpInitial));
 
 }
@@ -1266,12 +1166,11 @@ static void setupFitnessMachineService()
   virtualSupportedResistanceRangeChr->setValue(resistanceRange, sizeof(resistanceRange));
 
   // Initial Indoor Bike Data:
-  // flags 0x0040, speed 0, power 0.
-  uint8_t indoorInitial[6];
+  // flags 0x0041, power 0.
+  uint8_t indoorInitial[4];
 
-  writeU16(indoorInitial, 0, 0x0040);
-  writeU16(indoorInitial, 2, 0);
-  writeS16(indoorInitial, 4, 0);
+  writeU16(indoorInitial, 0, 0x0041);
+  writeS16(indoorInitial, 2, 0);
 
   virtualIndoorBikeDataChr->setValue(indoorInitial, sizeof(indoorInitial));
 
@@ -1387,22 +1286,6 @@ static void printStatus()
   Serial.print("outputPowerW: ");
   Serial.println(outputPowerW);
 
-  Serial.print("speedRaw 0.01kmh: ");
-  Serial.println(realSpeedRaw);
-
-  Serial.print("virtualSpeedKmh: ");
-  Serial.println(virtualSpeedMps * 3.6f, 2);
-
-  Serial.print("virtualDistanceKm: ");
-  Serial.println(
-    (virtualCumulativeWheelRevs + virtualWheelRemainder) *
-      VIRTUAL_WHEEL_CIRCUMFERENCE_M / 1000.0f,
-    3
-  );
-
-  Serial.print("virtualWheelRevs: ");
-  Serial.println(virtualCumulativeWheelRevs);
-
   Serial.print("activeTargetPower: ");
   Serial.println(activeTargetPower);
 
@@ -1495,9 +1378,6 @@ void setup()
   Serial.println();
   Serial.println("TrainerBridge boot");
 
-  Serial.print("Virtual speed model self-check: ");
-  Serial.println(virtualSpeedModelSelfCheck() ? "OK" : "FAILED");
-
   Serial.print("Trainer matcher self-check: ");
   Serial.println(trainerMatcherSelfCheck() ? "OK" : "FAILED");
 
@@ -1567,7 +1447,6 @@ void loop()
     realPowerW = 0;
     outputPowerW = 0;
     hasSmoothedOutputPower = false;
-    stopVirtualWheel(millis());
     notifyGarminCyclingPower();
     notifyAppIndoorBikeData();
   }

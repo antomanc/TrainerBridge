@@ -3,7 +3,7 @@
 TrainerBridge turns an ESP32 into a Bluetooth Low Energy bridge between an FTMS indoor trainer, training apps, and Garmin bike computers.
 
 - Zwift, MyWhoosh, TrainerDay, and other compatible apps receive FTMS data and can control the trainer.
-- Garmin and other bike computers receive Cycling Power Service (CPS) power and virtual wheel-revolution data.
+- Garmin and other bike computers receive measured power through the Cycling Power Service (CPS).
 - Both connections can be used at the same time.
 
 The firmware has been tested with a standard ESP32 and a Van Rysel D100 FTMS trainer. Other FTMS trainers can be selected by advertised name or MAC address.
@@ -16,9 +16,7 @@ FTMS trainer -> TrainerBridge
                   \-> CPS  -> Garmin
 ```
 
-TrainerBridge forwards measured trainer power with a small, responsive EMA filter. FTMS control commands from an app are queued and forwarded to the real trainer outside BLE callbacks for stability.
-
-Virtual distance is calculated from measured power using a fixed flat-road model rather than trainer flywheel speed. The default model uses 75 kg total mass, CdA 0.35, Crr 0.004, 97% drivetrain efficiency, and a 2105 mm wheel circumference. At 150 W it produces approximately 29.8 km/h, or 5 km in 10 minutes. The goal is repeatable indoor statistics, not matching the distance calculated by Zwift or MyWhoosh.
+TrainerBridge forwards measured trainer power with a small, responsive EMA filter. FTMS control commands from an app are queued and forwarded to the real trainer outside BLE callbacks for stability. The proxy intentionally does not publish speed, distance, wheel-revolution, or cadence data.
 
 ## Requirements
 
@@ -34,7 +32,6 @@ Edit [`TrainerBridge/Config.h`](TrainerBridge/Config.h):
 - `TARGET_NAME_CONTAINS`: case-insensitive substring of the trainer's advertised name. The default `RYSEL` matches names such as `VANRYSEL D100`, `VAN RYSEL D100`, and `VARYSEL D100`.
 - `TARGET_MAC`: optional exact trainer MAC address. A non-empty MAC takes priority over name matching.
 - `DEFAULT_POWER_SCALE`: measured-power calibration; `1.00` leaves trainer watts unchanged.
-- `VIRTUAL_*`: rider, road, and wheel values used by the virtual-distance model.
 - `DEBUG_LOG`: set to `1` temporarily for verbose BLE logs.
 
 If both trainer selectors are empty, TrainerBridge connects to the first device advertising FTMS.
@@ -66,16 +63,15 @@ Change the serial port or FQBN when using a different board. GitHub Actions comp
 1. Power on the trainer and ESP32.
 2. Remove an older proxy pairing after changing firmware or GATT features.
 3. Pair `TrainerBridge` with Garmin as a power sensor.
-4. Set wheel circumference to 2105 mm if Garmin offers the setting.
-5. Select `TrainerBridge` as the controllable trainer in the FTMS app.
+4. Select `TrainerBridge` as the controllable trainer in the FTMS app.
 
-Power reporting and trainer control are independent of virtual-distance support. A bike computer must consume the wheel-revolution fields included in CPS to record that distance.
+TrainerBridge reports power only to Garmin. It does not register as a speed or cadence sensor and does not generate distance.
 
 ## Serial diagnostics
 
-Open a serial monitor at 115200 baud and send `status`. It reports the selected trainer-matching rule, BLE connection state, measured and output power, virtual speed and distance, packet counters, and command-queue state.
+Open a serial monitor at 115200 baud and send `status`. It reports the selected trainer-matching rule, BLE connection state, measured and output power, packet counters, and command-queue state.
 
-At boot, TrainerBridge also runs self-checks for the trainer matcher and virtual-speed model. Both should report `OK`.
+At boot, TrainerBridge also runs a self-check for the trainer matcher. It should report `OK`.
 
 ## Project structure
 
