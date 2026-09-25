@@ -374,7 +374,13 @@ static void sendVirtualControlPointResponse(uint8_t requestedOpcode, uint8_t res
   virtualControlPointChr->setValue(resp, sizeof(resp));
   if (connHandle != CommandQueue::NO_CONN_HANDLE)
   {
-    virtualControlPointChr->indicate(resp, sizeof(resp), connHandle);
+    bool indOk = virtualControlPointChr->indicate(resp, sizeof(resp), connHandle);
+    Serial.printf("[CP INDICATE] connHandle=%d, ok=%d\n", connHandle, indOk ? 1 : 0);
+  }
+  else
+  {
+    bool indOk = virtualControlPointChr->indicate(resp, sizeof(resp));
+    Serial.printf("[CP INDICATE ALL] ok=%d\n", indOk ? 1 : 0);
   }
 }
 
@@ -622,10 +628,6 @@ class VirtualControlPointCallbacks : public NimBLECharacteristicCallbacks
     {
       sendVirtualControlPointResponse(opcode, FTMS_CP_RES_SUCCESS, clientConnHandle);
       notifyFtmsStatusStarted();
-      if (realConnected && realControlPointChr != nullptr)
-      {
-        writeRealControlPoint(cmd, len);
-      }
       return;
     }
 
@@ -633,10 +635,6 @@ class VirtualControlPointCallbacks : public NimBLECharacteristicCallbacks
     {
       sendVirtualControlPointResponse(opcode, FTMS_CP_RES_SUCCESS, clientConnHandle);
       notifyFtmsStatusStarted();
-      if (realConnected && realControlPointChr != nullptr)
-      {
-        writeRealControlPoint(cmd, len);
-      }
       return;
     }
 
@@ -912,6 +910,12 @@ static bool connectToRealTrainer()
       {
         LOGLN("Subscribe Real Control Point notifications FAILED");
       }
+    }
+
+    if (realControlPointChr->canWrite())
+    {
+      uint8_t reqCtrl[1] = {FTMS_CP_OP_REQUEST_CONTROL};
+      writeRealControlPoint(reqCtrl, sizeof(reqCtrl));
     }
   }
 
