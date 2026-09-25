@@ -205,13 +205,22 @@ static void printBytes(const char *label, const uint8_t *data, size_t len)
 
 static void startProxyAdvertising()
 {
+  if (!proxyReady) return;
+
   NimBLEAdvertising *adv = NimBLEDevice::getAdvertising();
 
   if (!adv->isAdvertising())
   {
-    adv->start();
-    proxyAdvertisingStartedOnce = true;
-    LOGLN("Advertising proxy avviato");
+    static unsigned long lastAdvAttemptAt = 0;
+    if (millis() - lastAdvAttemptAt >= 500)
+    {
+      lastAdvAttemptAt = millis();
+      if (adv->start())
+      {
+        proxyAdvertisingStartedOnce = true;
+        Serial.println("[ADV] Advertising proxy avviato");
+      }
+    }
   }
 }
 
@@ -222,7 +231,7 @@ static void stopProxyAdvertising()
   if (adv->isAdvertising())
   {
     adv->stop();
-    LOGLN("Advertising proxy fermato");
+    Serial.println("[ADV] Advertising proxy fermato");
   }
 }
 
@@ -359,7 +368,8 @@ static void sendVirtualControlPointResponse(uint8_t requestedOpcode, uint8_t res
 
   uint8_t resp[3] = {FTMS_CP_OP_RESPONSE_CODE, requestedOpcode, resultCode};
 
-  printBytes("Virtual CP response", resp, sizeof(resp));
+  Serial.printf("[CP RESP] opcode=0x%02X, res=0x%02X, connHandle=%d\n",
+    requestedOpcode, resultCode, connHandle);
 
   virtualControlPointChr->setValue(resp, sizeof(resp));
   if (connHandle != CommandQueue::NO_CONN_HANDLE)
@@ -492,6 +502,18 @@ static void realIndoorBikeDataCallback(
     virtualSpeedModel.update(filteredWatts, millis());
   }
 
+  static bool ftmsStartedNotified = false;
+  if (filteredWatts > 0 && !ftmsStartedNotified)
+  {
+    notifyFtmsStatusStarted();
+    ftmsStartedNotified = true;
+  }
+  else if (filteredWatts == 0 && ftmsStartedNotified && powerFilter.isStale(millis()))
+  {
+    notifyFtmsStatusStopped();
+    ftmsStartedNotified = false;
+  }
+
   notifyBoth(filteredWatts);
 }
 
@@ -524,6 +546,9 @@ static void realControlPointCallback(
     // Forward the real trainer's confirmation only to the client that sent the command
     if (virtualControlPointChr != nullptr)
     {
+      Serial.printf("[REAL CP RESP] opcode=0x%02X, res=0x%02X, targetConnHandle=%d\n",
+        opcode, result, pendingCpConnHandle);
+
       virtualControlPointChr->setValue(pData, length);
       if (pendingCpConnHandle != CommandQueue::NO_CONN_HANDLE)
       {
@@ -577,6 +602,9 @@ class VirtualControlPointCallbacks : public NimBLECharacteristicCallbacks
 
     uint16_t clientConnHandle = connInfo.getConnHandle();
 
+    Serial.printf("[CP WRITE] connHandle=%d, opcode=0x%02X, len=%d\n",
+      clientConnHandle, opcode, (int)len);
+
     if (len > CommandQueue::MAX_PAYLOAD_LEN)
     {
       sendVirtualControlPointResponse(opcode, FTMS_CP_RES_INVALID_PARAMETER, clientConnHandle);
@@ -586,6 +614,41 @@ class VirtualControlPointCallbacks : public NimBLECharacteristicCallbacks
     if (!realConnected || realControlPointChr == nullptr)
     {
       sendVirtualControlPointResponse(opcode, FTMS_CP_RES_OPERATION_FAILED, clientConnHandle);
+      return;
+    }
+
+    // Immediate handling of control and state transitions to prevent multi-master timeouts
+    if (opcode == FTMS_CP_OP_REQUEST_CONTROL)
+    {
+      sendVirtualControlPointResponse(opcode, FTMS_CP_RES_SUCCESS, clientConnHandle);
+      notifyFtmsStatusStarted();
+      if (realConnected && realControlPointChr != nullptr)
+      {
+        writeRealControlPoint(cmd, len);
+      }
+      return;
+    }
+
+    if (opcode == FTMS_CP_OP_START_RESUME)
+    {
+      sendVirtualControlPointResponse(opcode, FTMS_CP_RES_SUCCESS, clientConnHandle);
+      notifyFtmsStatusStarted();
+      if (realConnected && realControlPointChr != nullptr)
+      {
+        writeRealControlPoint(cmd, len);
+      }
+      return;
+    }
+
+    if (opcode == FTMS_CP_OP_RESET)
+    {
+      sendVirtualControlPointResponse(opcode, FTMS_CP_RES_SUCCESS, clientConnHandle);
+      if (virtualStatusChr != nullptr)
+      {
+        uint8_t st[1] = {FTMS_STATUS_RESET};
+        virtualStatusChr->setValue(st, sizeof(st));
+        virtualStatusChr->notify();
+      }
       return;
     }
 
@@ -605,14 +668,14 @@ class VirtualControlPointCallbacks : public NimBLECharacteristicCallbacks
 
   void onSubscribe(NimBLECharacteristic *chr, NimBLEConnInfo &connInfo, uint16_t subValue) override
   {
-    LOG("Virtual Control Point subscribe: ");
-    LOGLN(subValue);
+    Serial.printf("[CP SUBSCRIBE] connHandle=%d, subValue=%d\n",
+      connInfo.getConnHandle(), subValue);
   }
 
   void onStatus(NimBLECharacteristic *chr, NimBLEConnInfo &connInfo, int code) override
   {
-    LOG("Virtual Control Point indication status code: ");
-    LOGLN(code);
+    Serial.printf("[CP IND STATUS] connHandle=%d, code=%d\n",
+      connInfo.getConnHandle(), code);
   }
 };
 
@@ -626,10 +689,8 @@ class GenericCharacteristicCallbacks : public NimBLECharacteristicCallbacks
 {
   void onSubscribe(NimBLECharacteristic *chr, NimBLEConnInfo &connInfo, uint16_t subValue) override
   {
-    LOG("Subscribe ");
-    LOG(chr->getUUID().toString().c_str());
-    LOG(" = ");
-    LOGLN(subValue);
+    Serial.printf("[SUBSCRIBE] chr=%s, connHandle=%d, val=%d\n",
+      chr->getUUID().toString().c_str(), connInfo.getConnHandle(), subValue);
   }
 };
 
@@ -643,34 +704,24 @@ class ProxyServerCallbacks : public NimBLEServerCallbacks
 {
   void onConnect(NimBLEServer *server, NimBLEConnInfo &connInfo) override
   {
-    Serial.printf("Client connesso al proxy: connHandle=%d, total=%d\n",
-      connInfo.getConnHandle(), server->getConnectedCount());
-
-    // Stop advertising when 2 clients (e.g. App + Garmin) are connected; resume if fewer than 2
-    if (server->getConnectedCount() >= 2)
-    {
-      stopProxyAdvertising();
-    }
-    else
-    {
-      startProxyAdvertising();
-    }
+    Serial.printf("[BLE] Connect: connHandle=%d, addr=%s, total=%d\n",
+      connInfo.getConnHandle(),
+      connInfo.getAddress().toString().c_str(),
+      server->getConnectedCount());
   }
 
   void onDisconnect(NimBLEServer *server, NimBLEConnInfo &connInfo, int reason) override
   {
-    Serial.printf("Client disconnesso dal proxy: connHandle=%d, reason=0x%02X (%s), remaining=%d\n",
+    Serial.printf("[BLE] Disconnect: connHandle=%d, addr=%s, reason=0x%04X, remaining=%d\n",
       connInfo.getConnHandle(),
+      connInfo.getAddress().toString().c_str(),
       reason,
-      NimBLEUtils::returnCodeToString(reason),
       server->getConnectedCount());
 
     if (pendingCpConnHandle == connInfo.getConnHandle())
     {
       pendingCpConnHandle = CommandQueue::NO_CONN_HANDLE;
     }
-
-    startProxyAdvertising();
   }
 
   void onMTUChange(uint16_t MTU, NimBLEConnInfo &connInfo) override
@@ -1147,8 +1198,8 @@ static void setupFitnessMachineService()
   uint8_t cpInitial[3] = {FTMS_CP_OP_RESPONSE_CODE, 0x00, FTMS_CP_RES_SUCCESS};
   virtualControlPointChr->setValue(cpInitial, sizeof(cpInitial));
 
-  // Initial Status idle
-  uint8_t statusInitial[1] = {0x00};
+  // Initial Status: Reset (0x01 per Bluetooth SIG FTMS spec)
+  uint8_t statusInitial[1] = {FTMS_STATUS_RESET};
   virtualStatusChr->setValue(statusInitial, sizeof(statusInitial));
 }
 
@@ -1185,17 +1236,13 @@ static void setupProxyServer()
   uint8_t ftmsServiceData[3] = {0x01, 0x20, 0x00};
   adv->setServiceData(UUID_FTMS_SERVICE, ftmsServiceData, sizeof(ftmsServiceData));
 
-  adv->setMinInterval(160);
-  adv->setMaxInterval(320);
+  adv->setMinInterval(32);
+  adv->setMaxInterval(64);
+
+  // Start the GATT server now while no connections are active, registering all services in NimBLE tables
+  proxyServer->start();
 
   Serial.println("Proxy GATT server pronto");
-
-  // GAP advertising pre-initialization
-  startProxyAdvertising();
-  delay(300);
-  stopProxyAdvertising();
-
-  Serial.println("Advertising proxy inizializzato e fermato in attesa del rullo reale");
 }
 
 // =====================================================
@@ -1459,8 +1506,8 @@ void setup()
 
   NimBLEDevice::init(DEVICE_NAME);
 
-  // Set transmission power to P6 (+6 dBm): strong, reliable signal without brownout inrush spikes
-  NimBLEDevice::setPower(ESP_PWR_LVL_P6);
+  // Set transmission power to P9 (+9 dBm): maximum range and link robustness
+  NimBLEDevice::setPower(ESP_PWR_LVL_P9);
   NimBLEDevice::setMTU(185);
 
   setupProxyServer();
@@ -1480,9 +1527,6 @@ void loop()
   if (doConnectReal)
   {
     doConnectReal = false;
-
-    startProxyAdvertising();
-    delay(100);
 
     if (connectToRealTrainer())
     {
@@ -1516,6 +1560,19 @@ void loop()
     doScan = false;
 
     scan->start(8000, false, true);
+  }
+
+  // Keep proxy advertising active whenever fewer than 2 clients are connected
+  if (realConnected && proxyReady && proxyServer != nullptr)
+  {
+    if (proxyServer->getConnectedCount() < 2)
+    {
+      startProxyAdvertising();
+    }
+    else
+    {
+      stopProxyAdvertising();
+    }
   }
 
   // Power stale watchdog
