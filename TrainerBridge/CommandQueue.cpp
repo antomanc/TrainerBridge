@@ -15,7 +15,7 @@ bool CommandQueue::isCoalescentOpcode(uint8_t opcode)
           opcode == FTMS_CP_OP_SET_TARGET_RESISTANCE);
 }
 
-bool CommandQueue::push(const uint8_t *data, size_t len, uint8_t opcode, int16_t targetValue)
+bool CommandQueue::push(const uint8_t *data, size_t len, uint8_t opcode, int16_t targetValue, uint16_t connHandle)
 {
   if (data == nullptr || len == 0 || len > MAX_PAYLOAD_LEN) {
     return false;
@@ -32,6 +32,7 @@ bool CommandQueue::push(const uint8_t *data, size_t len, uint8_t opcode, int16_t
         memcpy(_buffer[idx].data, data, len);
         _buffer[idx].len = (uint8_t)len;
         _buffer[idx].targetValue = targetValue;
+        _buffer[idx].connHandle = connHandle;
         portEXIT_CRITICAL(&_mux);
         return true;
       }
@@ -47,6 +48,7 @@ bool CommandQueue::push(const uint8_t *data, size_t len, uint8_t opcode, int16_t
   _buffer[_tail].opcode = opcode;
   _buffer[_tail].len = (uint8_t)len;
   _buffer[_tail].targetValue = targetValue;
+  _buffer[_tail].connHandle = connHandle;
   memcpy(_buffer[_tail].data, data, len);
 
   _tail = (_tail + 1) % CAPACITY;

@@ -10,18 +10,20 @@ struct QueuedCommand {
   uint8_t len;
   uint8_t data[20];
   int16_t targetValue;
+  uint16_t connHandle;
 };
 
 class CommandQueue {
 public:
   static constexpr size_t CAPACITY = 8;
   static constexpr size_t MAX_PAYLOAD_LEN = 20;
+  static constexpr uint16_t NO_CONN_HANDLE = 0xFFFF;
 
   CommandQueue();
 
   // Pushes a command to the queue with coalescing for continuous updates (0x11, 0x05, 0x04).
   // Thread-safe across ESP32 cores. Returns true on success, false if queue is full.
-  bool push(const uint8_t *data, size_t len, uint8_t opcode, int16_t targetValue = 0);
+  bool push(const uint8_t *data, size_t len, uint8_t opcode, int16_t targetValue = 0, uint16_t connHandle = NO_CONN_HANDLE);
 
   // Pops the next command in FIFO order.
   // Thread-safe across ESP32 cores. Returns true if a command was extracted.

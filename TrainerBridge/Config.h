@@ -59,7 +59,7 @@ static constexpr uint16_t RESISTANCE_STEP = 1;
 static constexpr uint16_t CONN_INTERVAL_MIN = 24;
 static constexpr uint16_t CONN_INTERVAL_MAX = 40;
 static constexpr uint16_t CONN_LATENCY = 0;
-static constexpr uint16_t CONN_TIMEOUT = 200; // 2 s
+static constexpr uint16_t CONN_TIMEOUT = 600; // 6 s (robust supervision timeout)
 
 // If the trainer is unstable with acknowledged Control Point writes, set false.
 static constexpr bool REAL_CP_WRITE_WITH_RESPONSE = true;

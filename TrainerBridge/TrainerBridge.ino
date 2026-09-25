@@ -119,6 +119,7 @@ static bool proxyAdvertisingStartedOnce = false;
 // Control Point transaction tracking
 static volatile CpTxState cpTxState = CpTxState::IDLE;
 static uint8_t pendingCpOpcode = 0x00;
+static uint16_t pendingCpConnHandle = CommandQueue::NO_CONN_HANDLE;
 static unsigned long pendingCpSince = 0;
 static int16_t pendingTargetPower = 0;
 static int16_t activeTargetPower = 0;
@@ -352,7 +353,7 @@ static void notifyFtmsStatusIndoorSimulation(const uint8_t *cmd, size_t len)
   virtualStatusChr->notify();
 }
 
-static void sendVirtualControlPointResponse(uint8_t requestedOpcode, uint8_t resultCode)
+static void sendVirtualControlPointResponse(uint8_t requestedOpcode, uint8_t resultCode, uint16_t connHandle = CommandQueue::NO_CONN_HANDLE)
 {
   if (virtualControlPointChr == nullptr) return;
 
@@ -361,7 +362,10 @@ static void sendVirtualControlPointResponse(uint8_t requestedOpcode, uint8_t res
   printBytes("Virtual CP response", resp, sizeof(resp));
 
   virtualControlPointChr->setValue(resp, sizeof(resp));
-  virtualControlPointChr->indicate();
+  if (connHandle != CommandQueue::NO_CONN_HANDLE)
+  {
+    virtualControlPointChr->indicate(resp, sizeof(resp), connHandle);
+  }
 }
 
 // =====================================================
@@ -517,12 +521,16 @@ static void realControlPointCallback(
   {
     cpTxState = CpTxState::IDLE;
 
-    // Forward the real trainer's confirmation to the virtual control point
+    // Forward the real trainer's confirmation only to the client that sent the command
     if (virtualControlPointChr != nullptr)
     {
       virtualControlPointChr->setValue(pData, length);
-      virtualControlPointChr->indicate();
+      if (pendingCpConnHandle != CommandQueue::NO_CONN_HANDLE)
+      {
+        virtualControlPointChr->indicate(pData, length, pendingCpConnHandle);
+      }
     }
+    pendingCpConnHandle = CommandQueue::NO_CONN_HANDLE;
 
     // Emit status notifications ONLY after real trainer confirms success
     if (result == FTMS_CP_RES_SUCCESS)
@@ -567,15 +575,17 @@ class VirtualControlPointCallbacks : public NimBLECharacteristicCallbacks
     size_t len = value.length();
     uint8_t opcode = cmd[0];
 
+    uint16_t clientConnHandle = connInfo.getConnHandle();
+
     if (len > CommandQueue::MAX_PAYLOAD_LEN)
     {
-      sendVirtualControlPointResponse(opcode, FTMS_CP_RES_INVALID_PARAMETER);
+      sendVirtualControlPointResponse(opcode, FTMS_CP_RES_INVALID_PARAMETER, clientConnHandle);
       return;
     }
 
     if (!realConnected || realControlPointChr == nullptr)
     {
-      sendVirtualControlPointResponse(opcode, FTMS_CP_RES_OPERATION_FAILED);
+      sendVirtualControlPointResponse(opcode, FTMS_CP_RES_OPERATION_FAILED, clientConnHandle);
       return;
     }
 
@@ -586,10 +596,10 @@ class VirtualControlPointCallbacks : public NimBLECharacteristicCallbacks
     }
 
     // Push into thread-safe coalescing command queue
-    if (!commandQueue.push(cmd, len, opcode, targetVal))
+    if (!commandQueue.push(cmd, len, opcode, targetVal, clientConnHandle))
     {
       // Queue is full and could not coalesce
-      sendVirtualControlPointResponse(opcode, FTMS_CP_RES_OPERATION_FAILED);
+      sendVirtualControlPointResponse(opcode, FTMS_CP_RES_OPERATION_FAILED, clientConnHandle);
     }
   }
 
@@ -633,18 +643,15 @@ class ProxyServerCallbacks : public NimBLEServerCallbacks
 {
   void onConnect(NimBLEServer *server, NimBLEConnInfo &connInfo) override
   {
-    LOGLN("Client connesso al proxy");
+    Serial.printf("Client connesso al proxy: connHandle=%d, total=%d\n",
+      connInfo.getConnHandle(), server->getConnectedCount());
 
-    server->updateConnParams(
-      connInfo.getConnHandle(),
-      CONN_INTERVAL_MIN,
-      CONN_INTERVAL_MAX,
-      CONN_LATENCY,
-      CONN_TIMEOUT
-    );
-
-    // Continue advertising if fewer than 2 clients (Garmin + App) connected
-    if (server->getConnectedCount() < 2)
+    // Stop advertising when 2 clients (e.g. App + Garmin) are connected; resume if fewer than 2
+    if (server->getConnectedCount() >= 2)
+    {
+      stopProxyAdvertising();
+    }
+    else
     {
       startProxyAdvertising();
     }
@@ -652,8 +659,16 @@ class ProxyServerCallbacks : public NimBLEServerCallbacks
 
   void onDisconnect(NimBLEServer *server, NimBLEConnInfo &connInfo, int reason) override
   {
-    LOG("Client disconnesso dal proxy, reason=");
-    LOGLN(reason);
+    Serial.printf("Client disconnesso dal proxy: connHandle=%d, reason=0x%02X (%s), remaining=%d\n",
+      connInfo.getConnHandle(),
+      reason,
+      NimBLEUtils::returnCodeToString(reason),
+      server->getConnectedCount());
+
+    if (pendingCpConnHandle == connInfo.getConnHandle())
+    {
+      pendingCpConnHandle = CommandQueue::NO_CONN_HANDLE;
+    }
 
     startProxyAdvertising();
   }
@@ -1141,7 +1156,7 @@ static void setupProxyServer()
 {
   proxyServer = NimBLEDevice::createServer();
   proxyServer->setCallbacks(&proxyServerCallbacks);
-  proxyServer->advertiseOnDisconnect(true);
+  proxyServer->advertiseOnDisconnect(false);
 
   setupDeviceInformationService();
   setupCyclingPowerService();
@@ -1170,8 +1185,8 @@ static void setupProxyServer()
   uint8_t ftmsServiceData[3] = {0x01, 0x20, 0x00};
   adv->setServiceData(UUID_FTMS_SERVICE, ftmsServiceData, sizeof(ftmsServiceData));
 
-  adv->setMinInterval(32);
-  adv->setMaxInterval(64);
+  adv->setMinInterval(160);
+  adv->setMaxInterval(320);
 
   Serial.println("Proxy GATT server pronto");
 
@@ -1212,7 +1227,8 @@ static void processQueuedCommands()
     {
       LOGLN("Control Point transaction timeout");
       cpTxState = CpTxState::TIMED_OUT;
-      sendVirtualControlPointResponse(pendingCpOpcode, FTMS_CP_RES_OPERATION_FAILED);
+      sendVirtualControlPointResponse(pendingCpOpcode, FTMS_CP_RES_OPERATION_FAILED, pendingCpConnHandle);
+      pendingCpConnHandle = CommandQueue::NO_CONN_HANDLE;
     }
     return;
   }
@@ -1226,7 +1242,7 @@ static void processQueuedCommands()
 
   if (!realConnected || realControlPointChr == nullptr)
   {
-    sendVirtualControlPointResponse(cmd.opcode, FTMS_CP_RES_OPERATION_FAILED);
+    sendVirtualControlPointResponse(cmd.opcode, FTMS_CP_RES_OPERATION_FAILED, cmd.connHandle);
     return;
   }
 
@@ -1244,12 +1260,13 @@ static void processQueuedCommands()
 
   if (!ok)
   {
-    sendVirtualControlPointResponse(cmd.opcode, FTMS_CP_RES_OPERATION_FAILED);
+    sendVirtualControlPointResponse(cmd.opcode, FTMS_CP_RES_OPERATION_FAILED, cmd.connHandle);
     return;
   }
 
   cpTxState = CpTxState::WAITING_RESPONSE;
   pendingCpOpcode = cmd.opcode;
+  pendingCpConnHandle = cmd.connHandle;
   pendingCpSince = millis();
 }
 
