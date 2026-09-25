@@ -254,6 +254,7 @@ static void notifyGarminCyclingPower(int16_t watts)
     writeU16(cp, 8, virtualSpeedModel.getLastWheelEventTime2048());
 
     virtualCpsMeasurementChr->setValue(cp, sizeof(cp));
+    virtualCpsMeasurementChr->notify(cp, sizeof(cp));
   }
   else
   {
@@ -262,9 +263,9 @@ static void notifyGarminCyclingPower(int16_t watts)
     writeS16(cp, 2, watts);
 
     virtualCpsMeasurementChr->setValue(cp, sizeof(cp));
+    virtualCpsMeasurementChr->notify(cp, sizeof(cp));
   }
 
-  virtualCpsMeasurementChr->notify();
   packetsToGarmin++;
 }
 
@@ -282,7 +283,7 @@ static void notifyGarminCyclingSpeed()
   writeU16(csc, 5, virtualSpeedModel.getLastWheelEventTime1024());
 
   virtualCscMeasurementChr->setValue(csc, sizeof(csc));
-  virtualCscMeasurementChr->notify();
+  virtualCscMeasurementChr->notify(csc, sizeof(csc));
 }
 
 static void notifyAppIndoorBikeData(int16_t watts)
@@ -299,6 +300,7 @@ static void notifyAppIndoorBikeData(int16_t watts)
     writeS16(ftms, 7, watts);
 
     virtualIndoorBikeDataChr->setValue(ftms, sizeof(ftms));
+    virtualIndoorBikeDataChr->notify(ftms, sizeof(ftms));
   }
   else
   {
@@ -307,9 +309,9 @@ static void notifyAppIndoorBikeData(int16_t watts)
     writeS16(ftms, 2, watts);
 
     virtualIndoorBikeDataChr->setValue(ftms, sizeof(ftms));
+    virtualIndoorBikeDataChr->notify(ftms, sizeof(ftms));
   }
 
-  virtualIndoorBikeDataChr->notify();
   packetsToApp++;
 }
 
@@ -329,7 +331,7 @@ static void notifyFtmsStatusNewPower(int16_t watts)
   writeS16(status, 1, watts);
 
   virtualStatusChr->setValue(status, sizeof(status));
-  virtualStatusChr->notify();
+  virtualStatusChr->notify(status, sizeof(status));
 }
 
 static void notifyFtmsStatusStarted()
@@ -338,16 +340,16 @@ static void notifyFtmsStatusStarted()
 
   uint8_t status[1] = {FTMS_STATUS_STARTED};
   virtualStatusChr->setValue(status, sizeof(status));
-  virtualStatusChr->notify();
+  virtualStatusChr->notify(status, sizeof(status));
 }
 
 static void notifyFtmsStatusStopped()
 {
   if (virtualStatusChr == nullptr) return;
 
-  uint8_t status[1] = {FTMS_STATUS_STOPPED};
+  uint8_t status[2] = {FTMS_STATUS_STOPPED, 0x01}; // 0x01 = STOP per Bluetooth SIG FTMS spec
   virtualStatusChr->setValue(status, sizeof(status));
-  virtualStatusChr->notify();
+  virtualStatusChr->notify(status, sizeof(status));
 }
 
 static void notifyFtmsStatusIndoorSimulation(const uint8_t *cmd, size_t len)
@@ -359,7 +361,7 @@ static void notifyFtmsStatusIndoorSimulation(const uint8_t *cmd, size_t len)
   memcpy(&status[1], &cmd[1], 6);
 
   virtualStatusChr->setValue(status, sizeof(status));
-  virtualStatusChr->notify();
+  virtualStatusChr->notify(status, sizeof(status));
 }
 
 static void sendVirtualControlPointResponse(uint8_t requestedOpcode, uint8_t resultCode, uint16_t connHandle = CommandQueue::NO_CONN_HANDLE)
@@ -645,7 +647,7 @@ class VirtualControlPointCallbacks : public NimBLECharacteristicCallbacks
       {
         uint8_t st[1] = {FTMS_STATUS_RESET};
         virtualStatusChr->setValue(st, sizeof(st));
-        virtualStatusChr->notify();
+        virtualStatusChr->notify(st, sizeof(st));
       }
       return;
     }
