@@ -1,135 +1,51 @@
 /**
  * SPDX-License-Identifier: GPL-3.0-only
  *
- * TrainerBridge BLE trainer proxy - Stable queued-control version
+ * TrainerBridge BLE trainer proxy
  *
  * Real trainer:
- *   Van Rysel FTMS 0x1826
+ *   Van Rysel / FTMS 0x1826
  *   Indoor Bike Data 0x2AD2
  *   Fitness Machine Control Point 0x2AD9
  *
  * Virtual proxy exposed by ESP32:
  *   1. Fitness Machine Service 0x1826 for Zwift/MyWhoosh/TrainerDay
- *   2. Cycling Power Service 0x1818 for Garmin
+ *   2. Cycling Power Service 0x1818 for Garmin Power
+ *   3. Cycling Speed & Cadence Service 0x1816 for Garmin Speed & Distance
  *
  * Garmin receives:
- *   - Cycling Power Measurement 0x2A63
- *   - Measured power only
+ *   - Cycling Power Measurement 0x2A63 (Watts)
+ *   - Cycling Speed Measurement 0x2A5B (Native Speed & Distance)
  *
  * App receives:
  *   - FTMS Indoor Bike Data 0x2AD2
  *   - FTMS Control Point 0x2AD9
  *
- * Main stability fix:
- *   App writes to virtual Control Point -> command is queued.
- *   loop() forwards queued command to real trainer.
- *   We do NOT write to the real trainer inside the BLE server callback.
+ * Architecture:
+ *   - Modular components: FtmsConstants, PowerFilter, CommandQueue, TrainerMatcher, VirtualSpeedModel
+ *   - Physics-based flat-terrain aerodynamic and rolling resistance model
+ *   - Standard 1/1024s CSC wheel event timing for Garmin Edge/watches
+ *   - Flywheel coasting deceleration for realistic momentum
+ *   - Thread-safe FreeRTOS coalescing command queue
+ *   - Non-blocking serial CLI
+ *   - Brownout-safe BLE power profile (+6 dBm)
+ *   - Deterministic Control Point state machine (zero double-indication violations)
+ *   - Value-based BLE address handling (zero heap leaks)
  */
 
 #include <Arduino.h>
 #include <NimBLEDevice.h>
+#include "soc/soc.h"
+#include "soc/rtc_cntl_reg.h"
 #include "Config.h"
+#include "FtmsConstants.h"
+#include "PowerFilter.h"
+#include "CommandQueue.h"
+#include "TrainerMatcher.h"
+#include "VirtualSpeedModel.h"
 
 // =====================================================
-// UUID
-// =====================================================
-
-static NimBLEUUID UUID_FTMS_SERVICE("1826");
-static NimBLEUUID UUID_CPS_SERVICE("1818");
-static NimBLEUUID UUID_DIS_SERVICE("180A");
-
-// FTMS
-static NimBLEUUID UUID_FTMS_FEATURE("2ACC");
-static NimBLEUUID UUID_INDOOR_BIKE_DATA("2AD2");
-static NimBLEUUID UUID_SUPPORTED_RESISTANCE_RANGE("2AD6");
-static NimBLEUUID UUID_SUPPORTED_POWER_RANGE("2AD8");
-static NimBLEUUID UUID_FTMS_CONTROL_POINT("2AD9");
-static NimBLEUUID UUID_FTMS_STATUS("2ADA");
-
-// Cycling Power
-static NimBLEUUID UUID_CYCLING_POWER_MEASUREMENT("2A63");
-static NimBLEUUID UUID_CYCLING_POWER_FEATURE("2A65");
-static NimBLEUUID UUID_SENSOR_LOCATION("2A5D");
-
-// Device Information
-static NimBLEUUID UUID_MANUFACTURER_NAME("2A29");
-static NimBLEUUID UUID_MODEL_NUMBER("2A24");
-
-// =====================================================
-// REAL TRAINER CLIENT STATE
-// =====================================================
-
-static bool realConnected = false;
-static bool doScan = false;
-static bool scanning = false;
-static bool doConnectReal = false;
-
-static NimBLEAdvertisedDevice *realDevice = nullptr;
-static NimBLEClient *realClient = nullptr;
-
-static NimBLERemoteCharacteristic *realIndoorBikeDataChr = nullptr;
-static NimBLERemoteCharacteristic *realControlPointChr = nullptr;
-
-// =====================================================
-// VIRTUAL SERVER STATE
-// =====================================================
-
-static NimBLEServer *proxyServer = nullptr;
-
-static NimBLECharacteristic *virtualCpsMeasurementChr = nullptr;
-static NimBLECharacteristic *virtualCpsFeatureChr = nullptr;
-static NimBLECharacteristic *virtualCpsSensorLocationChr = nullptr;
-
-static NimBLECharacteristic *virtualFtmsFeatureChr = nullptr;
-static NimBLECharacteristic *virtualIndoorBikeDataChr = nullptr;
-static NimBLECharacteristic *virtualSupportedPowerRangeChr = nullptr;
-static NimBLECharacteristic *virtualSupportedResistanceRangeChr = nullptr;
-static NimBLECharacteristic *virtualControlPointChr = nullptr;
-static NimBLECharacteristic *virtualStatusChr = nullptr;
-
-static bool proxyAdvertisingStartedOnce = false;
-static bool proxyReady = false;
-
-// =====================================================
-// LIVE DATA
-// =====================================================
-
-static int16_t realPowerW = 0;
-static int16_t outputPowerW = 0;
-static float powerScale = DEFAULT_POWER_SCALE;
-static int32_t smoothedOutputPowerQ8 = 0;
-static bool hasSmoothedOutputPower = false;
-static int16_t realResistance = 0;
-
-static uint32_t packetsFromTrainer = 0;
-static uint32_t packetsToGarmin = 0;
-static uint32_t packetsToApp = 0;
-
-static unsigned long lastScanAt = 0;
-static unsigned long lastTrainerPacketAt = 0;
-
-#if DEBUG_LOG
-static unsigned long lastDebugAt = 0;
-#endif
-
-// Pending FTMS control command response
-static bool pendingCpResponse = false;
-static uint8_t pendingCpOpcode = 0x00;
-static unsigned long pendingCpSince = 0;
-
-static int16_t pendingTargetPower = 0;
-static int16_t activeTargetPower = 0;
-
-// Queued app command.
-// This avoids writing to the real trainer inside a BLE callback.
-static bool queuedAppCommand = false;
-static uint8_t queuedAppCommandData[20];
-static size_t queuedAppCommandLen = 0;
-static uint8_t queuedAppCommandOpcode = 0x00;
-static int16_t queuedTargetPower = 0;
-
-// =====================================================
-// UTILITY
+// LOGGING MACROS
 // =====================================================
 
 #if DEBUG_LOG
@@ -142,21 +58,91 @@ static int16_t queuedTargetPower = 0;
   #define LOGF(...)
 #endif
 
-static String lowerString(String s)
-{
-  s.toLowerCase();
-  return s;
-}
+// =====================================================
+// CONTROL POINT TRANSACTION STATE MACHINE
+// =====================================================
 
-static bool stringContainsIgnoreCase(String source, String needle)
-{
-  if (needle.length() == 0) return false;
+enum class CpTxState : uint8_t {
+  IDLE,
+  WAITING_RESPONSE,
+  TIMED_OUT
+};
 
-  source.toLowerCase();
-  needle.toLowerCase();
+// =====================================================
+// GLOBAL MODULES & STATE
+// =====================================================
 
-  return source.indexOf(needle) >= 0;
-}
+static PowerFilter powerFilter(
+  DEFAULT_POWER_SCALE,
+  SMOOTH_OUTPUT_POWER,
+  POWER_SMOOTHING_SHIFT,
+  POWER_STALE_TIMEOUT_MS
+);
+
+static CommandQueue commandQueue;
+static VirtualSpeedModel virtualSpeedModel;
+
+// Real trainer client state
+static volatile bool realConnected = false;
+static volatile bool doScan = false;
+static volatile bool scanning = false;
+static volatile bool doConnectReal = false;
+static volatile bool proxyReady = false;
+
+static NimBLEAddress realTrainerAddress;
+static NimBLEClient *realClient = nullptr;
+static NimBLERemoteCharacteristic *realIndoorBikeDataChr = nullptr;
+static NimBLERemoteCharacteristic *realControlPointChr = nullptr;
+
+// Virtual server state
+static NimBLEServer *proxyServer = nullptr;
+
+// Cycling Power (0x1818)
+static NimBLECharacteristic *virtualCpsMeasurementChr = nullptr;
+static NimBLECharacteristic *virtualCpsFeatureChr = nullptr;
+static NimBLECharacteristic *virtualCpsSensorLocationChr = nullptr;
+
+// Cycling Speed and Cadence (0x1816) for native Garmin speed & distance
+static NimBLECharacteristic *virtualCscMeasurementChr = nullptr;
+static NimBLECharacteristic *virtualCscFeatureChr = nullptr;
+
+// Fitness Machine Service (0x1826)
+static NimBLECharacteristic *virtualFtmsFeatureChr = nullptr;
+static NimBLECharacteristic *virtualIndoorBikeDataChr = nullptr;
+static NimBLECharacteristic *virtualSupportedPowerRangeChr = nullptr;
+static NimBLECharacteristic *virtualSupportedResistanceRangeChr = nullptr;
+static NimBLECharacteristic *virtualControlPointChr = nullptr;
+static NimBLECharacteristic *virtualStatusChr = nullptr;
+
+static bool proxyAdvertisingStartedOnce = false;
+
+// Control Point transaction tracking
+static volatile CpTxState cpTxState = CpTxState::IDLE;
+static uint8_t pendingCpOpcode = 0x00;
+static unsigned long pendingCpSince = 0;
+static int16_t pendingTargetPower = 0;
+static int16_t activeTargetPower = 0;
+static uint8_t pendingSimCommandData[CommandQueue::MAX_PAYLOAD_LEN];
+static size_t pendingSimCommandLen = 0;
+
+// Packet counters and diagnostics
+static uint32_t packetsFromTrainer = 0;
+static uint32_t packetsToGarmin = 0;
+static uint32_t packetsToApp = 0;
+
+static unsigned long lastScanAt = 0;
+
+#if DEBUG_LOG
+static unsigned long lastDebugAt = 0;
+#endif
+
+// Non-blocking serial buffer
+static char serialRxBuf[64];
+static size_t serialRxLen = 0;
+
+// =====================================================
+// UTILITY FUNCTIONS
+// =====================================================
 
 static int16_t readS16(const uint8_t *data, size_t index)
 {
@@ -180,6 +166,21 @@ static void writeU16(uint8_t *data, size_t index, uint16_t value)
   data[index + 1] = (value >> 8) & 0xff;
 }
 
+static void writeU24(uint8_t *data, size_t index, uint32_t value)
+{
+  data[index] = value & 0xff;
+  data[index + 1] = (value >> 8) & 0xff;
+  data[index + 2] = (value >> 16) & 0xff;
+}
+
+static void writeU32(uint8_t *data, size_t index, uint32_t value)
+{
+  data[index] = value & 0xff;
+  data[index + 1] = (value >> 8) & 0xff;
+  data[index + 2] = (value >> 16) & 0xff;
+  data[index + 3] = (value >> 24) & 0xff;
+}
+
 static void printBytes(const char *label, const uint8_t *data, size_t len)
 {
 #if DEBUG_LOG
@@ -197,70 +198,8 @@ static void printBytes(const char *label, const uint8_t *data, size_t len)
 #endif
 }
 
-static bool addressesMatch(const String &a, const String &b)
-{
-  return lowerString(a) == lowerString(b);
-}
-
-static bool matchesTrainerAdvertisement(
-  const String &name,
-  const String &address,
-  bool advertisesFtms,
-  const char *targetNameContains,
-  const char *targetMac
-)
-{
-  if (strlen(targetMac) > 0)
-  {
-    return addressesMatch(address, String(targetMac));
-  }
-
-  if (strlen(targetNameContains) > 0)
-  {
-    return stringContainsIgnoreCase(name, targetNameContains);
-  }
-
-  return advertisesFtms;
-}
-
-static bool trainerMatcherSelfCheck()
-{
-  return matchesTrainerAdvertisement("VanRysel D500", "AA:BB", false, "RYSEL", "") &&
-         matchesTrainerAdvertisement("Van Rysel D500", "AA:BB", false, "RYSEL", "") &&
-         matchesTrainerAdvertisement("Varysel D500", "AA:BB", false, "RYSEL", "") &&
-         !matchesTrainerAdvertisement("Other trainer", "AA:BB", true, "RYSEL", "") &&
-         matchesTrainerAdvertisement("Other", "AA:BB", false, "VANRYSEL", "aa:bb") &&
-         !matchesTrainerAdvertisement("VanRysel D500", "CC:DD", true, "VANRYSEL", "aa:bb") &&
-         matchesTrainerAdvertisement("Other", "AA:BB", true, "", "");
-}
-
-static int16_t getOutputPowerW()
-{
-  int16_t watts = (int16_t)(realPowerW * powerScale);
-
-  if (!SMOOTH_OUTPUT_POWER || watts <= 0)
-  {
-    smoothedOutputPowerQ8 = ((int32_t)watts) << 8;
-    hasSmoothedOutputPower = watts > 0;
-    return watts;
-  }
-
-  int32_t wattsQ8 = ((int32_t)watts) << 8;
-
-  if (!hasSmoothedOutputPower)
-  {
-    smoothedOutputPowerQ8 = wattsQ8;
-    hasSmoothedOutputPower = true;
-    return watts;
-  }
-
-  smoothedOutputPowerQ8 += (wattsQ8 - smoothedOutputPowerQ8) / (1 << POWER_SMOOTHING_SHIFT);
-
-  return (int16_t)((smoothedOutputPowerQ8 + 128) >> 8);
-}
-
 // =====================================================
-// ADVERTISING
+// ADVERTISING MANAGEMENT
 // =====================================================
 
 static void startProxyAdvertising()
@@ -287,48 +226,88 @@ static void stopProxyAdvertising()
 }
 
 // =====================================================
-// LOCAL NOTIFICATIONS
+// GATT SERVER NOTIFICATIONS
 // =====================================================
 
-static void notifyGarminCyclingPower()
+static void notifyGarminCyclingPower(int16_t watts)
 {
   if (virtualCpsMeasurementChr == nullptr) return;
 
-  // Cycling Power Measurement 0x2A63: instantaneous power only.
-  uint8_t cp[4];
+  if (ENABLE_VIRTUAL_SPEED)
+  {
+    // Cycling Power Measurement (0x2A63):
+    // Flags 0x0010 = Instantaneous Power + Wheel Revolution Data
+    uint8_t cp[10];
+    writeU16(cp, 0, 0x0010);
+    writeS16(cp, 2, watts);
+    writeU32(cp, 4, virtualSpeedModel.getCumulativeRevs());
+    writeU16(cp, 8, virtualSpeedModel.getLastWheelEventTime2048());
 
-  writeU16(cp, 0, 0x0000);
-  writeS16(cp, 2, outputPowerW);
+    virtualCpsMeasurementChr->setValue(cp, sizeof(cp));
+  }
+  else
+  {
+    uint8_t cp[4];
+    writeU16(cp, 0, 0x0000);
+    writeS16(cp, 2, watts);
 
-  virtualCpsMeasurementChr->setValue(cp, sizeof(cp));
+    virtualCpsMeasurementChr->setValue(cp, sizeof(cp));
+  }
+
   virtualCpsMeasurementChr->notify();
-
   packetsToGarmin++;
 }
 
-static void notifyAppIndoorBikeData()
+static void notifyGarminCyclingSpeed()
+{
+  if (virtualCscMeasurementChr == nullptr || !ENABLE_CSC_SERVICE || !ENABLE_VIRTUAL_SPEED) return;
+
+  // CSC Measurement (0x2A5B): 7 bytes
+  // Byte 0: Flags (0x01 = Wheel Revolution Data Present)
+  // Bytes 1..4: Cumulative Wheel Revolutions (uint32)
+  // Bytes 5..6: Last Wheel Event Time in 1/1024s resolution (uint16)
+  uint8_t csc[7];
+  csc[0] = CSC_MEASUREMENT_WHEEL_REV_PRESENT; // 0x01
+  writeU32(csc, 1, virtualSpeedModel.getCumulativeRevs());
+  writeU16(csc, 5, virtualSpeedModel.getLastWheelEventTime1024());
+
+  virtualCscMeasurementChr->setValue(csc, sizeof(csc));
+  virtualCscMeasurementChr->notify();
+}
+
+static void notifyAppIndoorBikeData(int16_t watts)
 {
   if (virtualIndoorBikeDataChr == nullptr) return;
 
-  // Indoor Bike Data 0x2AD2.
-  // flags 0x0041: More Data + instantaneous power present.
-  uint8_t ftms[4];
+  if (ENABLE_VIRTUAL_SPEED)
+  {
+    uint8_t ftms[9];
+    writeU16(ftms, 0, FTMS_IBD_FLAG_TOTAL_DISTANCE | FTMS_IBD_FLAG_INST_POWER); // 0x0050: speed present, distance present, power present
+    uint16_t speed001Kmh = (uint16_t)(virtualSpeedModel.getSpeedKmh() * 100.0f + 0.5f);
+    writeU16(ftms, 2, speed001Kmh);
+    writeU24(ftms, 4, virtualSpeedModel.getDistanceMeters());
+    writeS16(ftms, 7, watts);
 
-  writeU16(ftms, 0, 0x0041);
-  writeS16(ftms, 2, outputPowerW);
+    virtualIndoorBikeDataChr->setValue(ftms, sizeof(ftms));
+  }
+  else
+  {
+    uint8_t ftms[4];
+    writeU16(ftms, 0, FTMS_IBD_FLAG_MORE_DATA | FTMS_IBD_FLAG_INST_POWER); // 0x0041
+    writeS16(ftms, 2, watts);
 
-  virtualIndoorBikeDataChr->setValue(ftms, sizeof(ftms));
+    virtualIndoorBikeDataChr->setValue(ftms, sizeof(ftms));
+  }
+
   virtualIndoorBikeDataChr->notify();
-
   packetsToApp++;
 }
 
-static void notifyBothImmediately()
+static void notifyBoth(int16_t watts)
 {
-  outputPowerW = getOutputPowerW();
-
-  notifyGarminCyclingPower();
-  notifyAppIndoorBikeData();
+  notifyGarminCyclingPower(watts);
+  notifyGarminCyclingSpeed();
+  notifyAppIndoorBikeData(watts);
 }
 
 static void notifyFtmsStatusNewPower(int16_t watts)
@@ -336,9 +315,7 @@ static void notifyFtmsStatusNewPower(int16_t watts)
   if (virtualStatusChr == nullptr) return;
 
   uint8_t status[3];
-
-  // Best-effort status for new target power.
-  status[0] = 0x08;
+  status[0] = FTMS_STATUS_TARGET_POWER_CHANGED;
   writeS16(status, 1, watts);
 
   virtualStatusChr->setValue(status, sizeof(status));
@@ -349,8 +326,7 @@ static void notifyFtmsStatusStarted()
 {
   if (virtualStatusChr == nullptr) return;
 
-  uint8_t status[1] = {0x04};
-
+  uint8_t status[1] = {FTMS_STATUS_STARTED};
   virtualStatusChr->setValue(status, sizeof(status));
   virtualStatusChr->notify();
 }
@@ -359,185 +335,33 @@ static void notifyFtmsStatusStopped()
 {
   if (virtualStatusChr == nullptr) return;
 
-  uint8_t status[1] = {0x02};
-
+  uint8_t status[1] = {FTMS_STATUS_STOPPED};
   virtualStatusChr->setValue(status, sizeof(status));
   virtualStatusChr->notify();
 }
 
 static void notifyFtmsStatusIndoorSimulation(const uint8_t *cmd, size_t len)
 {
-  if (virtualStatusChr == nullptr) return;
-  if (len < 7) return;
+  if (virtualStatusChr == nullptr || len < 7) return;
 
   uint8_t status[7];
-
-  status[0] = 0x12;
-  status[1] = cmd[1];
-  status[2] = cmd[2];
-  status[3] = cmd[3];
-  status[4] = cmd[4];
-  status[5] = cmd[5];
-  status[6] = cmd[6];
+  status[0] = FTMS_STATUS_INDOOR_BIKE_SIM_CHANGED;
+  memcpy(&status[1], &cmd[1], 6);
 
   virtualStatusChr->setValue(status, sizeof(status));
   virtualStatusChr->notify();
 }
 
-// =====================================================
-// REAL TRAINER FTMS PARSER
-// =====================================================
-
-static bool parseRealIndoorBikeData(const uint8_t *pData, size_t length)
-{
-  if (length < 2) return false;
-
-  uint16_t flags = readU16(pData, 0);
-  size_t index = 2;
-  int16_t parsedResistance = realResistance;
-  int16_t parsedPowerW = realPowerW;
-  bool powerPresent = false;
-
-  // Skip the mandatory first field when the More Data flag is clear.
-  if ((flags & 0x0001) == 0)
-  {
-    if (index + 2 > length) return false;
-
-    index += 2;
-  }
-
-  if (flags & 0x0002)
-  {
-    if (index + 2 > length) return false;
-    index += 2;
-  }
-
-  if (flags & 0x0004)
-  {
-    if (index + 2 > length) return false;
-    index += 2;
-  }
-
-  if (flags & 0x0008)
-  {
-    if (index + 2 > length) return false;
-    index += 2;
-  }
-
-  if (flags & 0x0010)
-  {
-    if (index + 3 > length) return false;
-    index += 3;
-  }
-
-  if (flags & 0x0020)
-  {
-    if (index + 2 > length) return false;
-
-    parsedResistance = readS16(pData, index);
-    index += 2;
-  }
-
-  if (flags & 0x0040)
-  {
-    if (index + 2 > length) return false;
-
-    parsedPowerW = readS16(pData, index);
-    powerPresent = true;
-  }
-
-  if (!powerPresent) return false;
-
-  realResistance = parsedResistance;
-  realPowerW = parsedPowerW;
-
-  return true;
-}
-
-// =====================================================
-// CONTROL POINT RESPONSE
-// =====================================================
-
 static void sendVirtualControlPointResponse(uint8_t requestedOpcode, uint8_t resultCode)
 {
   if (virtualControlPointChr == nullptr) return;
 
-  uint8_t resp[3] = {0x80, requestedOpcode, resultCode};
+  uint8_t resp[3] = {FTMS_CP_OP_RESPONSE_CODE, requestedOpcode, resultCode};
 
   printBytes("Virtual CP response", resp, sizeof(resp));
 
   virtualControlPointChr->setValue(resp, sizeof(resp));
   virtualControlPointChr->indicate();
-
-  pendingCpResponse = false;
-}
-
-static void forwardRealControlPointResponseToApp(uint8_t *pData, size_t length)
-{
-  if (virtualControlPointChr == nullptr) return;
-  if (length < 3) return;
-
-  printBytes("Forward real CP response to app", pData, length);
-
-  virtualControlPointChr->setValue(pData, length);
-  virtualControlPointChr->indicate();
-
-  if (pData[0] == 0x80)
-  {
-    uint8_t opcode = pData[1];
-    uint8_t result = pData[2];
-
-    if (result == 0x01)
-    {
-      if (opcode == 0x05)
-      {
-        activeTargetPower = pendingTargetPower;
-        notifyFtmsStatusNewPower(activeTargetPower);
-      }
-      else if (opcode == 0x07)
-      {
-        notifyFtmsStatusStarted();
-      }
-      else if (opcode == 0x08)
-      {
-        notifyFtmsStatusStopped();
-      }
-    }
-  }
-
-  pendingCpResponse = false;
-}
-
-// =====================================================
-// REAL TRAINER CALLBACKS
-// =====================================================
-
-static void realIndoorBikeDataCallback(
-  NimBLERemoteCharacteristic *chr,
-  uint8_t *pData,
-  size_t length,
-  bool isNotify
-)
-{
-  if (!parseRealIndoorBikeData(pData, length)) return;
-
-  packetsFromTrainer++;
-  lastTrainerPacketAt = millis();
-
-  // Low latency: forward immediately.
-  notifyBothImmediately();
-}
-
-static void realControlPointCallback(
-  NimBLERemoteCharacteristic *chr,
-  uint8_t *pData,
-  size_t length,
-  bool isNotify
-)
-{
-  printBytes("Real CP response", pData, length);
-
-  forwardRealControlPointResponseToApp(pData, length);
 }
 
 // =====================================================
@@ -573,53 +397,155 @@ static bool writeRealControlPoint(const uint8_t *data, size_t length)
 }
 
 // =====================================================
-// QUEUED COMMAND PROCESSING
+// REAL TRAINER FTMS PARSER
 // =====================================================
 
-static void processQueuedAppCommand()
+static bool parseRealIndoorBikeData(const uint8_t *pData, size_t length, int16_t &outPowerW)
 {
-  if (!queuedAppCommand)
+  if (length < 2) return false;
+
+  uint16_t flags = readU16(pData, 0);
+  size_t index = 2;
+  bool powerPresent = false;
+  int16_t parsedPowerW = 0;
+
+  // More Data bit 0: when clear, Instantaneous Speed is present (uint16)
+  if ((flags & FTMS_IBD_FLAG_MORE_DATA) == 0)
   {
+    if (index + 2 > length) return false;
+    index += 2;
+  }
+
+  // Average Speed
+  if (flags & FTMS_IBD_FLAG_AVG_SPEED)
+  {
+    if (index + 2 > length) return false;
+    index += 2;
+  }
+
+  // Instantaneous Cadence
+  if (flags & FTMS_IBD_FLAG_INST_CADENCE)
+  {
+    if (index + 2 > length) return false;
+    index += 2;
+  }
+
+  // Average Cadence
+  if (flags & FTMS_IBD_FLAG_AVG_CADENCE)
+  {
+    if (index + 2 > length) return false;
+    index += 2;
+  }
+
+  // Total Distance
+  if (flags & FTMS_IBD_FLAG_TOTAL_DISTANCE)
+  {
+    if (index + 3 > length) return false;
+    index += 3;
+  }
+
+  // Resistance Level
+  if (flags & FTMS_IBD_FLAG_RESISTANCE_LEVEL)
+  {
+    if (index + 2 > length) return false;
+    index += 2;
+  }
+
+  // Instantaneous Power
+  if (flags & FTMS_IBD_FLAG_INST_POWER)
+  {
+    if (index + 2 > length) return false;
+    parsedPowerW = readS16(pData, index);
+    powerPresent = true;
+  }
+
+  if (!powerPresent) return false;
+
+  outPowerW = parsedPowerW;
+  return true;
+}
+
+// =====================================================
+// REAL TRAINER CALLBACKS
+// =====================================================
+
+static void realIndoorBikeDataCallback(
+  NimBLERemoteCharacteristic *chr,
+  uint8_t *pData,
+  size_t length,
+  bool isNotify
+)
+{
+  int16_t rawPower = 0;
+  if (!parseRealIndoorBikeData(pData, length, rawPower)) return;
+
+  packetsFromTrainer++;
+
+  int16_t filteredWatts = powerFilter.update(rawPower, millis());
+
+  if (ENABLE_VIRTUAL_SPEED)
+  {
+    virtualSpeedModel.update(filteredWatts, millis());
+  }
+
+  notifyBoth(filteredWatts);
+}
+
+static void realControlPointCallback(
+  NimBLERemoteCharacteristic *chr,
+  uint8_t *pData,
+  size_t length,
+  bool isNotify
+)
+{
+  printBytes("Real CP response", pData, length);
+
+  if (length < 3 || pData[0] != FTMS_CP_OP_RESPONSE_CODE) return;
+
+  uint8_t opcode = pData[1];
+  uint8_t result = pData[2];
+
+  // If the command already timed out, do not send a duplicate indication to app
+  if (cpTxState == CpTxState::TIMED_OUT)
+  {
+    LOGLN("Late real CP indication dropped after timeout");
+    cpTxState = CpTxState::IDLE;
     return;
   }
 
-  if (!realConnected || realControlPointChr == nullptr)
+  if (cpTxState == CpTxState::WAITING_RESPONSE)
   {
-    sendVirtualControlPointResponse(queuedAppCommandOpcode, 0x04);
-    queuedAppCommand = false;
-    return;
+    cpTxState = CpTxState::IDLE;
+
+    // Forward the real trainer's confirmation to the virtual control point
+    if (virtualControlPointChr != nullptr)
+    {
+      virtualControlPointChr->setValue(pData, length);
+      virtualControlPointChr->indicate();
+    }
+
+    // Emit status notifications ONLY after real trainer confirms success
+    if (result == FTMS_CP_RES_SUCCESS)
+    {
+      if (opcode == FTMS_CP_OP_SET_TARGET_POWER)
+      {
+        activeTargetPower = pendingTargetPower;
+        notifyFtmsStatusNewPower(activeTargetPower);
+      }
+      else if (opcode == FTMS_CP_OP_SET_INDOOR_BIKE_SIM && pendingSimCommandLen >= 7)
+      {
+        notifyFtmsStatusIndoorSimulation(pendingSimCommandData, pendingSimCommandLen);
+      }
+      else if (opcode == FTMS_CP_OP_START_RESUME)
+      {
+        notifyFtmsStatusStarted();
+      }
+      else if (opcode == FTMS_CP_OP_STOP_PAUSE)
+      {
+        notifyFtmsStatusStopped();
+      }
+    }
   }
-
-  if (pendingCpResponse)
-  {
-    return;
-  }
-
-  uint8_t opcode = queuedAppCommandOpcode;
-
-  if (opcode == 0x05 && queuedAppCommandLen >= 3)
-  {
-    pendingTargetPower = queuedTargetPower;
-  }
-  else if (opcode == 0x11 && queuedAppCommandLen >= 7)
-  {
-    notifyFtmsStatusIndoorSimulation(queuedAppCommandData, queuedAppCommandLen);
-  }
-
-  bool ok = writeRealControlPoint(queuedAppCommandData, queuedAppCommandLen);
-
-  if (!ok)
-  {
-    sendVirtualControlPointResponse(opcode, 0x04);
-    queuedAppCommand = false;
-    return;
-  }
-
-  pendingCpResponse = true;
-  pendingCpOpcode = opcode;
-  pendingCpSince = millis();
-
-  queuedAppCommand = false;
 }
 
 // =====================================================
@@ -628,7 +554,7 @@ static void processQueuedAppCommand()
 
 class VirtualControlPointCallbacks : public NimBLECharacteristicCallbacks
 {
-  void onWrite(NimBLECharacteristic *chr, NimBLEConnInfo &connInfo)
+  void onWrite(NimBLECharacteristic *chr, NimBLEConnInfo &connInfo) override
   {
     std::string value = chr->getValue();
 
@@ -641,48 +567,39 @@ class VirtualControlPointCallbacks : public NimBLECharacteristicCallbacks
     size_t len = value.length();
     uint8_t opcode = cmd[0];
 
-    if (len > sizeof(queuedAppCommandData))
+    if (len > CommandQueue::MAX_PAYLOAD_LEN)
     {
-      sendVirtualControlPointResponse(opcode, 0x03);
-      return;
-    }
-
-    if (queuedAppCommand || pendingCpResponse)
-    {
-      sendVirtualControlPointResponse(opcode, 0x04);
+      sendVirtualControlPointResponse(opcode, FTMS_CP_RES_INVALID_PARAMETER);
       return;
     }
 
     if (!realConnected || realControlPointChr == nullptr)
     {
-      sendVirtualControlPointResponse(opcode, 0x04);
+      sendVirtualControlPointResponse(opcode, FTMS_CP_RES_OPERATION_FAILED);
       return;
     }
 
-    memcpy(queuedAppCommandData, cmd, len);
-
-    queuedAppCommandLen = len;
-    queuedAppCommandOpcode = opcode;
-
-    if (opcode == 0x05 && len >= 3)
+    int16_t targetVal = 0;
+    if (opcode == FTMS_CP_OP_SET_TARGET_POWER && len >= 3)
     {
-      queuedTargetPower = readS16(cmd, 1);
-    }
-    else
-    {
-      queuedTargetPower = 0;
+      targetVal = readS16(cmd, 1);
     }
 
-    queuedAppCommand = true;
+    // Push into thread-safe coalescing command queue
+    if (!commandQueue.push(cmd, len, opcode, targetVal))
+    {
+      // Queue is full and could not coalesce
+      sendVirtualControlPointResponse(opcode, FTMS_CP_RES_OPERATION_FAILED);
+    }
   }
 
-  void onSubscribe(NimBLECharacteristic *chr, NimBLEConnInfo &connInfo, uint16_t subValue)
+  void onSubscribe(NimBLECharacteristic *chr, NimBLEConnInfo &connInfo, uint16_t subValue) override
   {
     LOG("Virtual Control Point subscribe: ");
     LOGLN(subValue);
   }
 
-  void onStatus(NimBLECharacteristic *chr, NimBLEConnInfo &connInfo, int code)
+  void onStatus(NimBLECharacteristic *chr, NimBLEConnInfo &connInfo, int code) override
   {
     LOG("Virtual Control Point indication status code: ");
     LOGLN(code);
@@ -697,7 +614,7 @@ static VirtualControlPointCallbacks virtualControlPointCallbacks;
 
 class GenericCharacteristicCallbacks : public NimBLECharacteristicCallbacks
 {
-  void onSubscribe(NimBLECharacteristic *chr, NimBLEConnInfo &connInfo, uint16_t subValue)
+  void onSubscribe(NimBLECharacteristic *chr, NimBLEConnInfo &connInfo, uint16_t subValue) override
   {
     LOG("Subscribe ");
     LOG(chr->getUUID().toString().c_str());
@@ -714,7 +631,7 @@ static GenericCharacteristicCallbacks genericCallbacks;
 
 class ProxyServerCallbacks : public NimBLEServerCallbacks
 {
-  void onConnect(NimBLEServer *server, NimBLEConnInfo &connInfo)
+  void onConnect(NimBLEServer *server, NimBLEConnInfo &connInfo) override
   {
     LOGLN("Client connesso al proxy");
 
@@ -726,14 +643,14 @@ class ProxyServerCallbacks : public NimBLEServerCallbacks
       CONN_TIMEOUT
     );
 
-    // Continue advertising for Garmin + app.
+    // Continue advertising if fewer than 2 clients (Garmin + App) connected
     if (server->getConnectedCount() < 2)
     {
       startProxyAdvertising();
     }
   }
 
-  void onDisconnect(NimBLEServer *server, NimBLEConnInfo &connInfo, int reason)
+  void onDisconnect(NimBLEServer *server, NimBLEConnInfo &connInfo, int reason) override
   {
     LOG("Client disconnesso dal proxy, reason=");
     LOGLN(reason);
@@ -741,7 +658,7 @@ class ProxyServerCallbacks : public NimBLEServerCallbacks
     startProxyAdvertising();
   }
 
-  void onMTUChange(uint16_t MTU, NimBLEConnInfo &connInfo)
+  void onMTUChange(uint16_t MTU, NimBLEConnInfo &connInfo) override
   {
     LOG("Proxy MTU changed: ");
     LOGLN(MTU);
@@ -756,14 +673,14 @@ static ProxyServerCallbacks proxyServerCallbacks;
 
 class RealClientCallbacks : public NimBLEClientCallbacks
 {
-  void onConnect(NimBLEClient *client)
+  void onConnect(NimBLEClient *client) override
   {
-    LOGLN("Connesso al Van Rysel reale");
+    LOGLN("Connesso al trainer reale");
   }
 
-  void onDisconnect(NimBLEClient *client, int reason)
+  void onDisconnect(NimBLEClient *client, int reason) override
   {
-    LOG("Disconnesso dal Van Rysel reale, reason=");
+    LOG("Disconnesso dal trainer reale, reason=");
     LOGLN(reason);
 
     realConnected = false;
@@ -772,13 +689,13 @@ class RealClientCallbacks : public NimBLEClientCallbacks
     realIndoorBikeDataChr = nullptr;
     realControlPointChr = nullptr;
 
-    pendingCpResponse = false;
-    queuedAppCommand = false;
-    hasSmoothedOutputPower = false;
-    realPowerW = 0;
-    outputPowerW = 0;
-    realResistance = 0;
-    lastTrainerPacketAt = 0;
+    cpTxState = CpTxState::IDLE;
+    commandQueue.clear();
+    powerFilter.reset();
+    virtualSpeedModel.stop(millis());
+
+    // Notify connected clients with 0 W so Garmin and Zwift do not freeze on old power
+    notifyBoth(0);
 
     stopProxyAdvertising();
 
@@ -786,13 +703,13 @@ class RealClientCallbacks : public NimBLEClientCallbacks
     lastScanAt = millis() + 3000;
   }
 
-  void onMTUChange(NimBLEClient *client, uint16_t MTU)
+  void onMTUChange(NimBLEClient *client, uint16_t MTU) override
   {
     LOG("Real trainer MTU changed: ");
     LOGLN(MTU);
   }
 
-  bool onConnParamsUpdateRequest(NimBLEClient *client, const ble_gap_upd_params *params)
+  bool onConnParamsUpdateRequest(NimBLEClient *client, const ble_gap_upd_params *params) override
   {
     return true;
   }
@@ -806,13 +723,7 @@ static RealClientCallbacks realClientCallbacks;
 
 static bool connectToRealTrainer()
 {
-  if (realDevice == nullptr)
-  {
-    LOGLN("realDevice null");
-    return false;
-  }
-
-  LOGLN("Connessione al Van Rysel reale...");
+  LOGLN("Connessione al trainer reale...");
 
   if (realClient == nullptr)
   {
@@ -834,7 +745,8 @@ static bool connectToRealTrainer()
   );
   realClient->setConnectTimeout(10000);
 
-  if (!realClient->connect(realDevice))
+  // Connect using value-stored address (zero dynamic heap allocation)
+  if (!realClient->connect(realTrainerAddress))
   {
     LOGLN("Connessione al trainer reale fallita");
 
@@ -951,7 +863,7 @@ static bool connectToRealTrainer()
 
 class RealScanCallbacks : public NimBLEScanCallbacks
 {
-  void onResult(const NimBLEAdvertisedDevice *advertisedDevice)
+  void onResult(const NimBLEAdvertisedDevice *advertisedDevice) override
   {
     String name = advertisedDevice->getName().c_str();
     String address = advertisedDevice->getAddress().toString().c_str();
@@ -977,7 +889,7 @@ class RealScanCallbacks : public NimBLEScanCallbacks
       advertisedDevice->haveServiceUUID() &&
       advertisedDevice->isAdvertisingService(UUID_FTMS_SERVICE);
 
-    bool matchesTarget = matchesTrainerAdvertisement(
+    bool matchesTarget = TrainerMatcher::matches(
       name,
       address,
       matchByUUID,
@@ -999,19 +911,13 @@ class RealScanCallbacks : public NimBLEScanCallbacks
       scanning = false;
       doScan = false;
 
-      if (realDevice != nullptr)
-      {
-        delete realDevice;
-        realDevice = nullptr;
-      }
-
-      realDevice = new NimBLEAdvertisedDevice(*advertisedDevice);
-
+      // Copy address by value (eliminates heap allocation & leaks)
+      realTrainerAddress = advertisedDevice->getAddress();
       doConnectReal = true;
     }
   }
 
-  void onScanEnd(const NimBLEScanResults &results, int reason)
+  void onScanEnd(const NimBLEScanResults &results, int reason) override
   {
     scanning = false;
 
@@ -1050,7 +956,6 @@ static void setupDeviceInformationService()
 
   manufacturer->setValue(DEVICE_NAME);
   model->setValue("FTMS-CPS Bridge");
-
 }
 
 static void setupCyclingPowerService()
@@ -1074,18 +979,65 @@ static void setupCyclingPowerService()
 
   virtualCpsMeasurementChr->setCallbacks(&genericCallbacks);
 
-  // No optional Cycling Power Measurement fields are supported.
-  uint8_t cpFeature[4] = {0};
+  // Cycling Power Feature 0x2A65:
+  // Bit 2 = 1 (Wheel Revolution Data Supported)
+  // Bits 20-21 = 0b01 (Not for use in a distributed system)
+  // Value: 0x00100004
+  uint8_t cpFeature[4];
+  writeU32(cpFeature, 0, 0x00100004);
   virtualCpsFeatureChr->setValue(cpFeature, sizeof(cpFeature));
 
-  // Sensor location.
-  uint8_t sensorLocation[1] = {0x0D};
+  // Sensor location: SENSOR_LOCATION_OTHER (0x00) prevents erroneous pedal calibration popups
+  uint8_t sensorLocation[1] = {CPS_SENSOR_LOCATION};
   virtualCpsSensorLocationChr->setValue(sensorLocation, sizeof(sensorLocation));
 
-  // Initial measurement: flags 0, instantaneous power 0.
-  uint8_t cpInitial[4] = {0};
-  virtualCpsMeasurementChr->setValue(cpInitial, sizeof(cpInitial));
+  // Initial measurement: instantaneous power 0, wheel revolutions 0
+  if (ENABLE_VIRTUAL_SPEED)
+  {
+    uint8_t cpInitial[10] = {0};
+    writeU16(cpInitial, 0, 0x0010); // flags: Wheel Revolution Data present
+    virtualCpsMeasurementChr->setValue(cpInitial, sizeof(cpInitial));
+  }
+  else
+  {
+    uint8_t cpInitial[4] = {0};
+    virtualCpsMeasurementChr->setValue(cpInitial, sizeof(cpInitial));
+  }
+}
 
+static void setupCyclingSpeedAndCadenceService()
+{
+  NimBLEService *csc = proxyServer->createService(UUID_CSC_SERVICE);
+
+  virtualCscFeatureChr = csc->createCharacteristic(
+    UUID_CSC_FEATURE,
+    NIMBLE_PROPERTY::READ
+  );
+
+  virtualCscMeasurementChr = csc->createCharacteristic(
+    UUID_CSC_MEASUREMENT,
+    NIMBLE_PROPERTY::NOTIFY
+  );
+
+  virtualCscMeasurementChr->setCallbacks(&genericCallbacks);
+
+  // CSC Feature 0x2A5C: Wheel Revolution Data Supported (bit 0 = 1)
+  uint8_t cscFeature[2];
+  writeU16(cscFeature, 0, CSC_FEATURE_WHEEL_REV_DATA); // 0x0001
+  virtualCscFeatureChr->setValue(cscFeature, sizeof(cscFeature));
+
+  // Sensor Location 0x2A5D: Other (0x00)
+  NimBLECharacteristic *cscSensorLocChr = csc->createCharacteristic(
+    UUID_SENSOR_LOCATION,
+    NIMBLE_PROPERTY::READ
+  );
+  uint8_t cscLoc[1] = {SENSOR_LOCATION_OTHER};
+  cscSensorLocChr->setValue(cscLoc, sizeof(cscLoc));
+
+  // Initial measurement: flags 0x01 (wheel data present), 7 bytes
+  uint8_t cscInitial[7] = {0};
+  cscInitial[0] = CSC_MEASUREMENT_WHEEL_REV_PRESENT; // 0x01
+  virtualCscMeasurementChr->setValue(cscInitial, sizeof(cscInitial));
 }
 
 static void setupFitnessMachineService()
@@ -1126,13 +1078,15 @@ static void setupFitnessMachineService()
   virtualStatusChr->setCallbacks(&genericCallbacks);
   virtualControlPointChr->setCallbacks(&virtualControlPointCallbacks);
 
-  // Fitness Machine Feature, 8 bytes.
-  // Pragmatic indoor-bike feature flags.
-  uint32_t machineFeatures = 0x00004080;
-  uint32_t targetFeatures = 0x0000200C;
+  // Fitness Machine Feature: 8 bytes
+  uint32_t machineFeatures = 0x00004080; // Power + Resistance supported
+  if (ENABLE_VIRTUAL_SPEED)
+  {
+    machineFeatures |= 0x00000004; // Bit 2: Total Distance Supported
+  }
+  uint32_t targetFeatures = 0x0000200C;  // Target Power, Resistance, and Simulation supported
 
   uint8_t featureData[8];
-
   featureData[0] = machineFeatures & 0xff;
   featureData[1] = (machineFeatures >> 8) & 0xff;
   featureData[2] = (machineFeatures >> 16) & 0xff;
@@ -1145,43 +1099,42 @@ static void setupFitnessMachineService()
 
   virtualFtmsFeatureChr->setValue(featureData, sizeof(featureData));
 
-  // Supported Power Range 0x2AD8:
-  // sint16 min, sint16 max, uint16 increment.
+  // Supported Power Range 0x2AD8
   uint8_t powerRange[6];
-
   writeS16(powerRange, 0, POWER_MIN_W);
   writeS16(powerRange, 2, POWER_MAX_W);
   writeU16(powerRange, 4, POWER_STEP_W);
-
   virtualSupportedPowerRangeChr->setValue(powerRange, sizeof(powerRange));
 
-  // Supported Resistance Level Range 0x2AD6:
-  // sint16 min, sint16 max, uint16 increment.
+  // Supported Resistance Level Range 0x2AD6
   uint8_t resistanceRange[6];
-
   writeS16(resistanceRange, 0, RESISTANCE_MIN);
   writeS16(resistanceRange, 2, RESISTANCE_MAX);
   writeU16(resistanceRange, 4, RESISTANCE_STEP);
-
   virtualSupportedResistanceRangeChr->setValue(resistanceRange, sizeof(resistanceRange));
 
-  // Initial Indoor Bike Data:
-  // flags 0x0041, power 0.
-  uint8_t indoorInitial[4];
-
-  writeU16(indoorInitial, 0, 0x0041);
-  writeS16(indoorInitial, 2, 0);
-
-  virtualIndoorBikeDataChr->setValue(indoorInitial, sizeof(indoorInitial));
+  // Initial Indoor Bike Data
+  if (ENABLE_VIRTUAL_SPEED)
+  {
+    uint8_t indoorInitial[9] = {0};
+    writeU16(indoorInitial, 0, FTMS_IBD_FLAG_TOTAL_DISTANCE | FTMS_IBD_FLAG_INST_POWER);
+    virtualIndoorBikeDataChr->setValue(indoorInitial, sizeof(indoorInitial));
+  }
+  else
+  {
+    uint8_t indoorInitial[4];
+    writeU16(indoorInitial, 0, FTMS_IBD_FLAG_MORE_DATA | FTMS_IBD_FLAG_INST_POWER);
+    writeS16(indoorInitial, 2, 0);
+    virtualIndoorBikeDataChr->setValue(indoorInitial, sizeof(indoorInitial));
+  }
 
   // Initial Control Point response
-  uint8_t cpInitial[3] = {0x80, 0x00, 0x01};
+  uint8_t cpInitial[3] = {FTMS_CP_OP_RESPONSE_CODE, 0x00, FTMS_CP_RES_SUCCESS};
   virtualControlPointChr->setValue(cpInitial, sizeof(cpInitial));
 
   // Initial Status idle
   uint8_t statusInitial[1] = {0x00};
   virtualStatusChr->setValue(statusInitial, sizeof(statusInitial));
-
 }
 
 static void setupProxyServer()
@@ -1192,36 +1145,39 @@ static void setupProxyServer()
 
   setupDeviceInformationService();
   setupCyclingPowerService();
+  if (ENABLE_CSC_SERVICE)
+  {
+    setupCyclingSpeedAndCadenceService();
+  }
   setupFitnessMachineService();
 
   NimBLEAdvertising *adv = NimBLEDevice::getAdvertising();
-
   adv->reset();
+  // Enable scan response before setting name so the local name goes to scan response,
+  // ensuring that all 3 service UUIDs fit into the primary 31-byte advertising packet.
+  adv->enableScanResponse(true);
   adv->setName(DEVICE_NAME);
-
-  // Best-effort cycling/trainer-ish appearance.
-  adv->setAppearance(0x0480);
+  adv->setAppearance(0x0480); // Generic Cycling
 
   adv->addServiceUUID(UUID_FTMS_SERVICE);
   adv->addServiceUUID(UUID_CPS_SERVICE);
+  if (ENABLE_CSC_SERVICE)
+  {
+    adv->addServiceUUID(UUID_CSC_SERVICE);
+  }
 
-  // FTMS service data, useful for app discovery.
+  // FTMS service data for app discovery
   uint8_t ftmsServiceData[3] = {0x01, 0x20, 0x00};
   adv->setServiceData(UUID_FTMS_SERVICE, ftmsServiceData, sizeof(ftmsServiceData));
 
-  adv->enableScanResponse(true);
   adv->setMinInterval(32);
   adv->setMaxInterval(64);
 
   Serial.println("Proxy GATT server pronto");
 
-  // Critical fix:
-  // Start advertising once at boot, then stop it.
-  // This initializes GAP advertising before using ESP32 as BLE client.
+  // GAP advertising pre-initialization
   startProxyAdvertising();
-
   delay(300);
-
   stopProxyAdvertising();
 
   Serial.println("Advertising proxy inizializzato e fermato in attesa del rullo reale");
@@ -1234,7 +1190,6 @@ static void setupProxyServer()
 static void setupScanner()
 {
   NimBLEScan *scan = NimBLEDevice::getScan();
-
   scan->setScanCallbacks(&realScanCallbacks, false);
   scan->setActiveScan(true);
   scan->setInterval(100);
@@ -1245,7 +1200,61 @@ static void setupScanner()
 }
 
 // =====================================================
-// SERIAL STATUS
+// COMMAND PROCESSING & STATE MACHINE
+// =====================================================
+
+static void processQueuedCommands()
+{
+  // If an acknowledged command is currently awaiting confirmation from the real trainer
+  if (cpTxState == CpTxState::WAITING_RESPONSE)
+  {
+    if (millis() - pendingCpSince > CP_TIMEOUT_MS)
+    {
+      LOGLN("Control Point transaction timeout");
+      cpTxState = CpTxState::TIMED_OUT;
+      sendVirtualControlPointResponse(pendingCpOpcode, FTMS_CP_RES_OPERATION_FAILED);
+    }
+    return;
+  }
+
+  // Ready for next command
+  QueuedCommand cmd;
+  if (!commandQueue.pop(cmd))
+  {
+    return;
+  }
+
+  if (!realConnected || realControlPointChr == nullptr)
+  {
+    sendVirtualControlPointResponse(cmd.opcode, FTMS_CP_RES_OPERATION_FAILED);
+    return;
+  }
+
+  if (cmd.opcode == FTMS_CP_OP_SET_TARGET_POWER)
+  {
+    pendingTargetPower = cmd.targetValue;
+  }
+  else if (cmd.opcode == FTMS_CP_OP_SET_INDOOR_BIKE_SIM)
+  {
+    pendingSimCommandLen = cmd.len;
+    memcpy(pendingSimCommandData, cmd.data, cmd.len);
+  }
+
+  bool ok = writeRealControlPoint(cmd.data, cmd.len);
+
+  if (!ok)
+  {
+    sendVirtualControlPointResponse(cmd.opcode, FTMS_CP_RES_OPERATION_FAILED);
+    return;
+  }
+
+  cpTxState = CpTxState::WAITING_RESPONSE;
+  pendingCpOpcode = cmd.opcode;
+  pendingCpSince = millis();
+}
+
+// =====================================================
+// SERIAL STATUS & NON-BLOCKING CLI
 // =====================================================
 
 static void printStatus()
@@ -1263,7 +1272,6 @@ static void printStatus()
   Serial.println(proxyServer ? proxyServer->getConnectedCount() : 0);
 
   Serial.print("trainerMatch: ");
-
   if (strlen(TARGET_MAC) > 0)
   {
     Serial.print("MAC equals ");
@@ -1281,10 +1289,22 @@ static void printStatus()
   }
 
   Serial.print("realPowerW: ");
-  Serial.println(realPowerW);
+  Serial.println(powerFilter.getLastRaw());
 
   Serial.print("outputPowerW: ");
-  Serial.println(outputPowerW);
+  Serial.println(powerFilter.getLastOutput());
+
+  Serial.print("virtualSpeedKmh: ");
+  Serial.println(virtualSpeedModel.getSpeedKmh(), 2);
+
+  Serial.print("virtualDistanceKm: ");
+  Serial.println(virtualSpeedModel.getDistanceKm(), 3);
+
+  Serial.print("cumulativeWheelRevs: ");
+  Serial.println(virtualSpeedModel.getCumulativeRevs());
+
+  Serial.print("powerScale: ");
+  Serial.println(powerFilter.getScale(), 2);
 
   Serial.print("activeTargetPower: ");
   Serial.println(activeTargetPower);
@@ -1298,11 +1318,12 @@ static void printStatus()
   Serial.print("packetsToApp: ");
   Serial.println(packetsToApp);
 
-  Serial.print("pendingCpResponse: ");
-  Serial.println(pendingCpResponse ? "true" : "false");
+  Serial.print("queuedCommands: ");
+  Serial.println(commandQueue.count());
 
-  Serial.print("queuedAppCommand: ");
-  Serial.println(queuedAppCommand ? "true" : "false");
+  Serial.print("cpTxState: ");
+  Serial.println(cpTxState == CpTxState::IDLE ? "IDLE" :
+                 (cpTxState == CpTxState::WAITING_RESPONSE ? "WAITING_RESPONSE" : "TIMED_OUT"));
 
   Serial.print("proxyAdvertisingStartedOnce: ");
   Serial.println(proxyAdvertisingStartedOnce ? "true" : "false");
@@ -1311,14 +1332,13 @@ static void printStatus()
   Serial.println();
 }
 
-static void handleSerial()
+static void executeSerialCommand(const char *rawCmd)
 {
-  if (!Serial.available()) return;
-
-  String cmd = Serial.readStringUntil('\n');
-
+  String cmd = String(rawCmd);
   cmd.trim();
   cmd.toLowerCase();
+
+  if (cmd.length() == 0) return;
 
   if (cmd == "status")
   {
@@ -1334,55 +1354,96 @@ static void handleSerial()
   }
   else if (cmd.startsWith("scale"))
   {
-    float s = cmd.substring(5).toFloat();
+    String numStr = cmd.substring(5);
+    numStr.trim();
+    float s = numStr.toFloat();
 
-    if (s > 0.1 && s < 5.0)
+    if (s >= 0.1f && s <= 5.0f)
     {
-      powerScale = s;
-
+      powerFilter.setScale(s);
       Serial.print("powerScale=");
-      Serial.println(powerScale);
+      Serial.println(powerFilter.getScale(), 2);
+    }
+    else
+    {
+      Serial.println("Invalid scale (0.1 - 5.0)");
     }
   }
   else if (cmd.startsWith("p"))
   {
-    int watts = cmd.substring(1).toInt();
+    String wattsStr = cmd.substring(1);
+    wattsStr.trim();
+    int watts = wattsStr.toInt();
 
     if (watts > 0 && watts <= POWER_MAX_W && realConnected && realControlPointChr != nullptr)
     {
       uint8_t c[3];
+      c[0] = FTMS_CP_OP_SET_TARGET_POWER;
+      writeS16(c, 1, (int16_t)watts);
 
-      c[0] = 0x05;
-      writeS16(c, 1, watts);
-
-      pendingTargetPower = watts;
-
-      writeRealControlPoint(c, sizeof(c));
+      commandQueue.push(c, sizeof(c), FTMS_CP_OP_SET_TARGET_POWER, (int16_t)watts);
+      Serial.print("Target power queued: ");
+      Serial.println(watts);
     }
   }
   else
   {
-    Serial.println("Comandi: status, adv, noadv, scale1.28, p150");
+    Serial.println("Comandi: status, adv, noadv, scale 1.28, p 150");
+  }
+}
+
+static void handleSerialNonBlocking()
+{
+  while (Serial.available() > 0)
+  {
+    char c = (char)Serial.read();
+
+    if (c == '\r') continue;
+
+    if (c == '\n')
+    {
+      if (serialRxLen > 0)
+      {
+        serialRxBuf[serialRxLen] = '\0';
+        executeSerialCommand(serialRxBuf);
+        serialRxLen = 0;
+      }
+    }
+    else
+    {
+      if (serialRxLen < sizeof(serialRxBuf) - 1)
+      {
+        serialRxBuf[serialRxLen++] = c;
+      }
+    }
   }
 }
 
 // =====================================================
-// SETUP / LOOP
+// SETUP & LOOP
 // =====================================================
 
 void setup()
 {
+  // Disable brownout detector to prevent resets caused by microsecond voltage dips when USB RF initializes
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
+
   Serial.begin(115200);
   delay(1000);
 
   Serial.println();
   Serial.println("TrainerBridge boot");
 
+  Serial.print("Virtual speed model self-check: ");
+  Serial.println(VirtualSpeedModel::selfCheck() ? "OK" : "FAILED");
+
   Serial.print("Trainer matcher self-check: ");
-  Serial.println(trainerMatcherSelfCheck() ? "OK" : "FAILED");
+  Serial.println(TrainerMatcher::selfCheck() ? "OK" : "FAILED");
 
   NimBLEDevice::init(DEVICE_NAME);
-  NimBLEDevice::setPower(ESP_PWR_LVL_P9);
+
+  // Set transmission power to P6 (+6 dBm): strong, reliable signal without brownout inrush spikes
+  NimBLEDevice::setPower(ESP_PWR_LVL_P6);
   NimBLEDevice::setMTU(185);
 
   setupProxyServer();
@@ -1393,19 +1454,17 @@ void setup()
 
 void loop()
 {
-  handleSerial();
+  handleSerialNonBlocking();
 
-  // Process app command outside BLE callback.
-  processQueuedAppCommand();
+  // Process queued app commands outside BLE callback
+  processQueuedCommands();
 
+  // Connect to real trainer when matched
   if (doConnectReal)
   {
     doConnectReal = false;
 
-    // Critical:
-    // Re-enable advertising BEFORE connecting as BLE client to the real trainer.
     startProxyAdvertising();
-
     delay(100);
 
     if (connectToRealTrainer())
@@ -1426,14 +1485,14 @@ void loop()
     }
   }
 
+  // Periodic trainer scan
   if (!realConnected && doScan && !scanning && millis() >= lastScanAt)
   {
-    Serial.println("Avvio scan Van Rysel reale...");
+    Serial.println("Avvio scan trainer reale...");
 
     stopProxyAdvertising();
 
     NimBLEScan *scan = NimBLEDevice::getScan();
-
     scan->clearResults();
 
     scanning = true;
@@ -1442,20 +1501,12 @@ void loop()
     scan->start(8000, false, true);
   }
 
-  if (realConnected && outputPowerW != 0 && lastTrainerPacketAt > 0 && millis() - lastTrainerPacketAt > POWER_STALE_TIMEOUT_MS)
+  // Power stale watchdog
+  if (realConnected && powerFilter.getLastOutput() != 0 && powerFilter.isStale(millis()))
   {
-    realPowerW = 0;
-    outputPowerW = 0;
-    hasSmoothedOutputPower = false;
-    notifyGarminCyclingPower();
-    notifyAppIndoorBikeData();
-  }
-
-  // Timeout Control Point response.
-  // Avoid leaving Zwift/MyWhoosh hanging forever.
-  if (pendingCpResponse && millis() - pendingCpSince > 1200)
-  {
-    sendVirtualControlPointResponse(pendingCpOpcode, 0x04);
+    powerFilter.reset();
+    virtualSpeedModel.stop(millis());
+    notifyBoth(0);
   }
 
 #if DEBUG_LOG
@@ -1473,7 +1524,7 @@ void loop()
     Serial.print(proxyServer ? proxyServer->getConnectedCount() : 0);
 
     Serial.print(" power=");
-    Serial.print(outputPowerW);
+    Serial.print(powerFilter.getLastOutput());
 
     Serial.print(" target=");
     Serial.print(activeTargetPower);

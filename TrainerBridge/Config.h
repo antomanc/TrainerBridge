@@ -1,5 +1,7 @@
 #pragma once
 
+#include <stdint.h>
+
 // =====================================================
 // USER SETTINGS
 // =====================================================
@@ -28,6 +30,20 @@ static constexpr uint8_t POWER_SMOOTHING_SHIFT = 2;
 static constexpr unsigned long POWER_STALE_TIMEOUT_MS = 1500;
 
 // =====================================================
+// VIRTUAL SPEED & DISTANCE MODEL
+// =====================================================
+
+static constexpr bool ENABLE_VIRTUAL_SPEED = true;
+static constexpr bool ENABLE_CSC_SERVICE = true;                // Broadcast standard BLE Speed Sensor (0x1816) for Garmin
+static constexpr float VIRTUAL_TOTAL_MASS_KG = 85.0f;           // Rider (75 kg) + Bike (10 kg)
+static constexpr float VIRTUAL_CRR = 0.004f;                    // Rolling resistance coefficient
+static constexpr float VIRTUAL_CDA = 0.32f;                     // Aerodynamic drag area (m^2)
+static constexpr float VIRTUAL_AIR_DENSITY_KG_M3 = 1.225f;      // Sea-level air density
+static constexpr float VIRTUAL_DRIVETRAIN_EFFICIENCY = 0.98f;   // 98% efficiency
+static constexpr float VIRTUAL_WHEEL_CIRCUMFERENCE_M = 2.096f;  // Standard 700x25c wheel circumference
+static constexpr float VIRTUAL_COASTING_DECEL_RATE = 1.5f;      // Flywheel coasting deceleration (m/s^2)
+
+// =====================================================
 // ADVANCED BLE SETTINGS
 // =====================================================
 
@@ -47,3 +63,10 @@ static constexpr uint16_t CONN_TIMEOUT = 200; // 2 s
 
 // If the trainer is unstable with acknowledged Control Point writes, set false.
 static constexpr bool REAL_CP_WRITE_WITH_RESPONSE = true;
+
+// Control Point transaction timeout in milliseconds
+static constexpr unsigned long CP_TIMEOUT_MS = 1200;
+
+// Sensor Location exposed via Cycling Power Service (0x2A5D)
+// 0x00 = Other, 0x0B = Rear Wheel (avoids pedal calibration prompts on Garmin)
+static constexpr uint8_t CPS_SENSOR_LOCATION = 0x00;
