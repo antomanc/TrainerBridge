@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdint.h>
+#include <Arduino.h>
 
 // =====================================================
 // USER SETTINGS
@@ -19,6 +20,29 @@ static constexpr char DEVICE_NAME[] = "TrainerBridge";
 // VANRYSEL, VAN RYSEL, and VARYSEL while remaining trainer-specific.
 static constexpr char TARGET_NAME_CONTAINS[] = "RYSEL";
 static constexpr char TARGET_MAC[] = "";
+
+// =====================================================
+// HARDWARE / STATUS LED
+// =====================================================
+
+// Enable onboard/external LED for visual status indication
+static constexpr bool ENABLE_STATUS_LED = true;
+
+// GPIO pin for the status LED.
+// On most ESP32 DevKit V1 boards, the built-in blue LED is on GPIO 2.
+#if defined(LED_BUILTIN)
+static constexpr int8_t STATUS_LED_PIN = LED_BUILTIN;
+#else
+static constexpr int8_t STATUS_LED_PIN = 2;
+#endif
+
+// True if driving HIGH turns the LED ON (standard DevKit V1).
+// Set false if the LED is wired active-LOW.
+static constexpr bool STATUS_LED_ACTIVE_HIGH = true;
+
+// When true: blinks at 1 Hz while searching/connecting to the trainer.
+// When false: stays OFF until the real trainer is connected.
+static constexpr bool STATUS_LED_BLINK_WHILE_SCANNING = true;
 
 // Measured-power calibration. 1.00 leaves the trainer watts unchanged.
 static constexpr float DEFAULT_POWER_SCALE = 1.00f;

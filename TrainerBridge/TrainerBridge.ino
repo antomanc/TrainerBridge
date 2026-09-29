@@ -22,7 +22,7 @@
  *   - FTMS Control Point 0x2AD9
  *
  * Architecture:
- *   - Modular components: FtmsConstants, PowerFilter, CommandQueue, TrainerMatcher, VirtualSpeedModel
+ *   - Modular components: FtmsConstants, PowerFilter, CommandQueue, TrainerMatcher, VirtualSpeedModel, StatusLed
  *   - Physics-based flat-terrain aerodynamic and rolling resistance model
  *   - Standard 1/1024s CSC wheel event timing for Garmin Edge/watches
  *   - Flywheel coasting deceleration for realistic momentum
@@ -43,6 +43,7 @@
 #include "CommandQueue.h"
 #include "TrainerMatcher.h"
 #include "VirtualSpeedModel.h"
+#include "StatusLed.h"
 
 // =====================================================
 // LOGGING MACROS
@@ -81,6 +82,7 @@ static PowerFilter powerFilter(
 
 static CommandQueue commandQueue;
 static VirtualSpeedModel virtualSpeedModel;
+static StatusLed statusLed;
 
 // Real trainer client state
 static volatile bool realConnected = false;
@@ -1398,6 +1400,21 @@ static void printStatus()
   Serial.print("proxyAdvertisingStartedOnce: ");
   Serial.println(proxyAdvertisingStartedOnce ? "true" : "false");
 
+  Serial.print("statusLed: ");
+  if (!ENABLE_STATUS_LED)
+  {
+    Serial.println("disabled");
+  }
+  else
+  {
+    Serial.print("GPIO ");
+    Serial.print(STATUS_LED_PIN);
+    Serial.print(" [");
+    Serial.print(statusLed.getState() == LedState::SOLID_ON ? "SOLID_ON" :
+                 (statusLed.getState() == LedState::BLINK_SCANNING ? "BLINK_SCANNING" : "OFF"));
+    Serial.println("]");
+  }
+
   Serial.println("==============================");
   Serial.println();
 }
@@ -1501,8 +1518,18 @@ void setup()
   Serial.begin(115200);
   delay(1000);
 
+  statusLed.begin(
+    STATUS_LED_PIN,
+    STATUS_LED_ACTIVE_HIGH,
+    ENABLE_STATUS_LED,
+    STATUS_LED_BLINK_WHILE_SCANNING
+  );
+
   Serial.println();
   Serial.println("TrainerBridge boot");
+
+  Serial.print("Status LED self-check: ");
+  Serial.println(StatusLed::selfCheck() ? "OK" : "FAILED");
 
   Serial.print("Virtual speed model self-check: ");
   Serial.println(VirtualSpeedModel::selfCheck() ? "OK" : "FAILED");
@@ -1524,6 +1551,8 @@ void setup()
 
 void loop()
 {
+  statusLed.update(realConnected, scanning || doScan || doConnectReal);
+
   handleSerialNonBlocking();
 
   // Process queued app commands outside BLE callback

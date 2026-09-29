@@ -83,7 +83,21 @@ Edit [`TrainerBridge/Config.h`](TrainerBridge/Config.h):
 - `ENABLE_VIRTUAL_SPEED`: enables physics-based speed and distance calculation.
 - `ENABLE_CSC_SERVICE`: enables the standard BLE Speed Sensor GATT service.
 - `VIRTUAL_WHEEL_CIRCUMFERENCE_M`: virtual wheel circumference (default: `2.096f` for $700\times 25\text{c}$).
+- `ENABLE_STATUS_LED`: enables onboard/external LED for visual status indication (default: `true`).
+- `STATUS_LED_PIN`: GPIO pin for status LED (default: `2` / `LED_BUILTIN` on standard ESP32 DevKit).
+- `STATUS_LED_ACTIVE_HIGH`: polarity of the LED (default: `true`).
+- `STATUS_LED_BLINK_WHILE_SCANNING`: blinks at 1 Hz while searching/connecting, solid ON when connected (default: `true`).
 - `DEBUG_LOG`: set to `1` temporarily for verbose serial debugging.
+
+### Hardware Status LED
+
+When operating headless without a serial monitor, the onboard LED provides immediate visual feedback:
+
+| LED State | Meaning |
+|---|---|
+| **Blinking (1 Hz)** | ESP32 is active and searching/connecting to the smart trainer |
+| **Solid ON** | Real trainer connected and proxy services ready for Garmin / apps |
+| **OFF** | Board unpowered or status LED disabled in `Config.h` |
 
 ---
 
@@ -155,6 +169,7 @@ TrainerBridge/
 ├── CommandQueue.h/.cpp   Thread-safe FreeRTOS coalescing command queue
 ├── TrainerMatcher.h/.cpp Trainer MAC/name matching with boot self-check
 ├── VirtualSpeedModel.h/.cpp Flat-road aerodynamic engine & dual-resolution event timers
+├── StatusLed.h/.cpp      Non-blocking visual connection & scan status indicator
 └── TrainerBridge.ino     Firmware entrypoint, GATT services & BLE state machines
 ```
 
