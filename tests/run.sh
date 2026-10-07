@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")/.."
+build_dir=$(mktemp -d)
+trap 'rm -rf "$build_dir"' EXIT
+"${CXX:-g++}" -std=c++17 -Wall -Wextra -Wno-unused-parameter \
+  -Itests/stubs -ITrainerBridge tests/firmware_test.cpp \
+  TrainerBridge/{CommandQueue,PowerFilter,TrainerMatcher,VirtualSpeedModel,StatusLed}.cpp \
+  -o "$build_dir/firmware_test"
+"$build_dir/firmware_test"
