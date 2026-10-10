@@ -1,202 +1,129 @@
 # TrainerBridge
 
-TrainerBridge turns an ESP32 into a high-performance Bluetooth Low Energy (BLE) proxy between an indoor smart trainer (such as the Van Rysel D100), cycling training apps (Zwift, MyWhoosh, TrainerDay), and Garmin bike computers / watches.
+**Turn an ESP32 into a Bluetooth bridge that lets Zwift and your Garmin use the same smart trainer at the same time.**
 
-- **Cycling Apps** (Zwift, MyWhoosh, TrainerDay) receive FTMS telemetry and control trainer resistance via standard FTMS Control Point commands.
-- **Garmin Edge & Watches** receive live Power (Watts) and native simulated flat-terrain Speed (km/h) and Distance (km) without requiring GPS or external sensors.
-- Simultaneous multi-client connections: Ride on Zwift while simultaneously recording on your Garmin Edge.
+Many trainers accept only one Bluetooth connection at a time, so you pick: ERG mode in the app, or power
+and speed on your Garmin. TrainerBridge connects to the trainer once and re-publishes it as a
+new device that **several apps and bike computers can pair with at once**. Apps keep full control
+(ERG, simulation grade), and Garmin gets power, speed and distance without GPS or extra sensors.
 
-Tested and validated on a standard ESP32 with the Decathlon Van Rysel D100 FTMS smart trainer. Other FTMS trainers can be paired by advertised name or MAC address.
-
----
-
-## Architecture & How It Works
-
-```text
-Real Trainer (FTMS 0x1826) 
-        │
-   [BLE Client]
-        ▼
-  TrainerBridge (ESP32)
-   ├── Physics Engine (CdA 0.32, Crr 0.004, 85 kg mass, flywheel coasting)
-   ├── Power Filter (Q8 EMA smoothing, scale calibration, stale watchdog)
-   └── Coalescing Queue (Thread-safe FreeRTOS ring buffer)
-        │
-   [BLE Server / Proxy]
-        ├── FTMS (0x1826) ────► Zwift / MyWhoosh / TrainerDay (Interactive ERG / Sim)
-        │                 └──► Garmin Edge (Unified Smart Trainer mode)
-        ├── CSC  (0x1816) ────► Garmin Speed & Cadence (1/1024s wheel event time)
-        └── CPS  (0x1818) ────► Garmin Cycling Power (Watts)
+```bash
+make deps upload   # pinned ESP32 core + NimBLE, then build and flash
 ```
 
-### Tri-Service GATT Implementation
-1. **Fitness Machine Service (FTMS `0x1826`)**:
-   - `0x2AD2` (Indoor Bike Data): Transmits Instantaneous Power, Instantaneous Speed ($0.01\text{ km/h}$ resolution), and Total Distance ($1\text{ m}$ resolution, `uint24`).
-   - `0x2ACC` (Fitness Machine Feature): Declares support for Power, Resistance, and Total Distance.
-   - `0x2AD9` (Control Point): Receives app commands (target power, simulation grade, start/stop) and queues them for deterministic delivery to the real trainer.
-2. **Cycling Speed and Cadence (CSC `0x1816`)**:
-   - `0x2A5B` (CSC Measurement): Broadcasts cumulative wheel revolutions and high-resolution wheel event timing ($1/1024\text{ s}$ resolution) for native Garmin speed sensor pairing.
-   - `0x2A5C` (CSC Feature) & `0x2A5D` (Sensor Location): Full Bluetooth SIG compliance.
-3. **Cycling Power Service (CPS `0x1818`)**:
-   - `0x2A63` (Power Measurement): Broadcasts Instantaneous Power in Watts for standalone power meter profiles.
+[![CI](https://github.com/antomanc/TrainerBridge/actions/workflows/ci.yml/badge.svg)](https://github.com/antomanc/TrainerBridge/actions)
+[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 
----
+> Tested on a standard ESP32 DevKit with the Decathlon Van Rysel D100. Other FTMS trainers
+> should work: pair them by advertised name or MAC address.
 
-## Physics Engine (Virtual Speed & Distance)
+## Why
 
-On flat road ($0\%$ grade) with no wind, the power delivered to the wheels is opposed by aerodynamic drag and rolling resistance:
+Riding indoors with an app *and* a bike computer usually means compromises:
+- the trainer drops the Garmin as soon as Zwift connects, or the other way round
+- no speed or distance on the Garmin indoors, because there's no GPS and no wheel sensor
+- ride data split between the app and your Garmin history
+- a separate power meter or speed sensor just to record the ride twice
 
-$$P_{\text{wheel}} = \left(C_{\text{rr}} \cdot m_{\text{total}} \cdot g\right) v + \left(\frac{1}{2} \cdot \rho \cdot C_d A\right) v^3$$
+TrainerBridge sits in between and gives everyone what they need from one trainer connection.
 
-* **Total mass ($m$)**: $85\text{ kg}$ (rider $75\text{ kg}$ + bike $10\text{ kg}$)
-* **Rolling resistance ($C_{\text{rr}}$)**: $0.004$ (standard performance road tire on smooth asphalt)
-* **Aerodynamic drag ($C_d A$)**: $0.32\text{ m}^2$ (standard endurance road position on the hoods)
-* **Air density ($\rho$)**: $1.225\text{ kg/m}^3$ (sea level)
-* **Drivetrain efficiency ($\eta$)**: $0.98$ ($98\%$)
-* **Coasting Deceleration**: $1.5\text{ m/s}^2$ smooth flywheel coasting when pedaling ceases, preventing sudden auto-pauses on Garmin.
+## What you get
 
-**Speed Benchmarks:**
-* $100\text{ W} \to \approx 26.0\text{ km/h}$
-* $150\text{ W} \to \approx 30.5\text{ km/h}$
-* $200\text{ W} \to \approx 34.0\text{ km/h}$
-* $250\text{ W} \to \approx 36.9\text{ km/h}$
-* $300\text{ W} \to \approx 39.4\text{ km/h}$
-
----
-
-## Requirements
-
-- ESP32 Arduino core **3.3.12**
-- [NimBLE-Arduino](https://github.com/h2zero/NimBLE-Arduino) **2.5.1**
-- Arduino CLI or Arduino IDE
-
----
-
-## Configuration
-
-Edit [`TrainerBridge/Config.h`](TrainerBridge/Config.h):
-
-- `DEVICE_NAME`: BLE name exposed to apps and bike computers (default: `"TrainerBridge"`).
-- `TARGET_NAME_CONTAINS`: case-insensitive substring of the trainer's advertised name (default: `"RYSEL"`).
-- `TARGET_MAC`: optional exact trainer MAC address (takes priority over name matching).
-- `DEFAULT_POWER_SCALE`: measured-power multiplier (default: `1.00`).
-- `ENABLE_VIRTUAL_SPEED`: enables physics-based speed and distance calculation.
-- `ENABLE_CSC_SERVICE`: enables the standard BLE Speed Sensor GATT service.
-- `VIRTUAL_WHEEL_CIRCUMFERENCE_M`: virtual wheel circumference (default: `2.096f` for $700\times 25\text{c}$).
-- `ENABLE_STATUS_LED`: enables onboard/external LED for visual status indication (default: `true`).
-- `STATUS_LED_PIN`: GPIO pin for status LED (default: `2` / `LED_BUILTIN` on standard ESP32 DevKit).
-- `STATUS_LED_ACTIVE_HIGH`: polarity of the LED (default: `true`).
-- `STATUS_LED_BLINK_WHILE_SCANNING`: blinks at 1 Hz while searching/connecting, solid ON when connected (default: `true`).
-- `DEBUG_LOG`: set to `1` temporarily for verbose serial debugging.
-
-### Hardware Status LED
-
-When operating headless without a serial monitor, the onboard LED provides immediate visual feedback:
-
-| LED State | Meaning |
+| | |
 |---|---|
-| **Blinking (1 Hz)** | ESP32 is active and searching/connecting to the smart trainer |
-| **Solid ON** | Real trainer connected and proxy services ready for Garmin / apps |
-| **OFF** | Board unpowered or status LED disabled in `Config.h` |
+| **Apps** | Zwift, MyWhoosh, TrainerDay and any FTMS app see a controllable trainer: ERG target power, simulation grade, start/stop, routed to the real trainer |
+| **Garmin** | Edge and watches pair it as a **Smart Trainer**, or as separate **Power** and **Speed** sensors |
+| **Speed & distance** | Physics-based virtual speed on a flat road (CdA, rolling resistance, 85 kg rider + bike), with flywheel coasting so Garmin doesn't auto-pause |
+| **Multi-client** | App and Garmin connected together; each gets the same telemetry, and control responses go only to the client that sent the command |
+| **Recovery** | Trainer power-cycled? Clients get 0 W immediately, and the bridge keeps scanning and reconnects on its own |
+| **Status LED** | Blinks while searching, solid once the trainer is connected. No serial monitor needed |
+| **Diagnostics** | Serial console with live status, power calibration and manual ERG commands |
 
----
+## Quick start
 
-## Build and Flash
-
-Install the pinned dependencies and compile with all warnings enabled:
-
-```bash
-arduino-cli core update-index \
-  --additional-urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
-arduino-cli core install esp32:esp32@3.3.12 \
-  --additional-urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
-arduino-cli lib install NimBLE-Arduino@2.5.1
-arduino-cli compile --warnings all --fqbn esp32:esp32:esp32 TrainerBridge
-```
-
-Upload to a connected ESP32:
+You need an ESP32 (the classic ESP32, e.g. a DevKit V1), a USB cable and
+[Arduino CLI](https://arduino.github.io/arduino-cli/) (or the Arduino IDE with
+ESP32 Arduino core **3.3.12** and NimBLE-Arduino **2.5.1**).
 
 ```bash
-arduino-cli upload --port /dev/ttyUSB0 --fqbn esp32:esp32:esp32 TrainerBridge
+git clone https://github.com/antomanc/TrainerBridge && cd TrainerBridge
+make deps                          # install the pinned core and library (once)
+make upload PORT=/dev/ttyUSB0      # build with all warnings and flash
+make monitor                       # optional: serial console at 115200 baud
 ```
 
----
+Turn on the trainer: the LED blinks while the bridge looks for it and stays on once connected.
+Then pair your devices with **TrainerBridge**:
 
-## Software Checks and Hardware Validation
+**Garmin Edge or watch**: *Settings > Sensors > Add Sensor > Smart Trainer*, pick
+TrainerBridge. You get power, speed and distance over one connection. If asked for a wheel
+size, use **2096 mm**. (Alternatively, add it as a *Speed/Cadence* sensor and a *Power* sensor.)
 
-Run the host regression harness with a C++17 compiler:
+**Zwift, MyWhoosh, TrainerDay**: in the pairing screen, choose TrainerBridge for both
+**Controllable** and **Power Source**.
+
+## Configure
+
+Everything lives in [`TrainerBridge/Config.h`](TrainerBridge/Config.h). Defaults work for a
+Van Rysel D100. The settings you are most likely to change:
+
+| Setting | Default | |
+|---|---|---|
+| `TARGET_NAME_CONTAINS` | `"RYSEL"` | Case-insensitive part of the trainer's Bluetooth name |
+| `TARGET_MAC` | `""` | Exact trainer MAC. Takes priority over the name; leave both empty to use the first FTMS trainer found |
+| `DEVICE_NAME` | `"TrainerBridge"` | Name apps and Garmin see |
+| `DEFAULT_POWER_SCALE` | `1.00` | Multiply the trainer's watts, if it reads high or low |
+| `ENABLE_VIRTUAL_SPEED` | `true` | Physics-based speed and distance |
+| `ENABLE_CSC_SERVICE` | `true` | Speed sensor service for Garmin |
+| `VIRTUAL_WHEEL_CIRCUMFERENCE_M` | `2.096` | Match the wheel size set on your Garmin (700x25c) |
+| `STATUS_LED_PIN` | `LED_BUILTIN` or `2` | Status LED GPIO; `STATUS_LED_ACTIVE_HIGH` sets polarity |
+| `DEBUG_LOG` | `0` | Set to `1` for verbose serial logging while debugging |
+
+Rider mass, CdA, rolling resistance and coasting are in the same file.
+[→ How it works](docs/how-it-works.md) explains the model and the Bluetooth services.
+
+## Serial console
+
+Open the serial port at 115200 baud (`make monitor`):
+
+```
+status        Connection, power, virtual speed, distance and control queue state
+scale 1.05    Change the power calibration until reboot
+p 200         Send an ERG target of 200 W to the trainer (testing)
+adv / noadv   Start or stop advertising to apps and Garmin
+```
+
+## Design
+
+- **One trainer connection, many clients.** The ESP32 is the only device that talks to the
+  trainer, so apps and Garmin never fight over it.
+- **The trainer has the last word.** ERG and simulation commands are queued, sent one at a
+  time, and the app gets the trainer's real answer, not an optimistic one. Commands that time
+  out or hit a disconnect fail right away instead of leaving the app waiting.
+- **Answers go to whoever asked.** Control responses are sent only to the client that sent
+  the command, so the Garmin never sees an app's traffic (Garmin drops sensors that send
+  unexpected indications).
+- **Never blocks the Bluetooth stack.** Writes to the trainer happen in the main loop, not in
+  Bluetooth callbacks. State shared between the two is locked.
+- **Fails safe.** If the trainer disappears, every client sees 0 W immediately, not a frozen
+  number.
+
+## Development
 
 ```bash
-bash tests/run.sh
+make test       # host tests: the real sketch against Arduino/NimBLE test doubles (g++ only)
+make check      # tests with AddressSanitizer + UBSan, then the real firmware build
 ```
 
-The harness executes the firmware callbacks and loop with Arduino/NimBLE test doubles,
-including the existing module self-checks, scan retry timing, repeated reconnects,
-multi-client telemetry routing, and FTMS transactions. CI also compiles against the
-real pinned libraries with `--warnings all`. Test doubles do not validate the BLE
-stack, FreeRTOS concurrency, radio delivery, or scan-response timer lifetime.
-
-See [the patch upgrade validation notes](tests/VALIDATION.md) for coverage, known
-limitations, and the physical ESP32/trainer/Garmin/app checks still required for
-ESP32 Arduino 3.3.12 and NimBLE-Arduino 2.5.1.
-
----
-
-## Pairing Guide
-
-### Connecting to Garmin Edge or Watch
-
-You can pair using either of the following methods:
-
-#### Method 1: Smart Trainer Mode (Recommended)
-1. Power on your trainer and the ESP32.
-2. On your Garmin, navigate to **Settings > Sensors > Add Sensor > Smart Trainer**.
-3. Select **TrainerBridge** and add it.
-4. Garmin receives Power, Speed, and Distance simultaneously over a single unified Bluetooth channel.
-5. If prompted for a wheel size in the sensor details, set it to **2096 mm**.
-
-#### Method 2: Speed + Power Sensor Mode
-1. On your Garmin, navigate to **Settings > Sensors > Add Sensor > Speed/Cadence** (or **Search All**).
-2. Select **TrainerBridge** and add it. Set wheel size to **2096 mm**.
-3. Add **TrainerBridge** under **Power** sensors if not already paired.
-4. Both services communicate concurrently over the same physical Bluetooth link.
-
-### Connecting to Cycling Apps (Zwift / MyWhoosh / TrainerDay)
-1. In the app's pairing screen, search for **Controllable** and **Power Source**.
-2. Select **TrainerBridge**.
-3. Resistance, target power, and simulation gradients are automatically routed to the real trainer.
-
----
-
-## Serial Diagnostics & CLI
-
-Open the serial monitor at **115200 baud**. Commands:
-
-- `status`: prints connection status, power, virtual speed, distance, wheel revs, and queue state.
-- `scale <value>`: adjusts the live power calibration multiplier (e.g., `scale 1.05`).
-- `p <watts>`: queues a manual ERG target power command for testing (e.g., `p 200`).
-- `adv` / `noadv`: manually starts or stops proxy BLE advertising.
-
----
-
-## Project Structure
-
-```text
-TrainerBridge/
-├── Config.h              User parameters & physics constants
-├── FtmsConstants.h       BLE UUIDs, opcodes, and bitfield flags
-├── PowerFilter.h/.cpp    Q8 EMA power filter & zero-lag coasting
-├── CommandQueue.h/.cpp   Thread-safe FreeRTOS coalescing command queue
-├── TrainerMatcher.h/.cpp Trainer MAC/name matching with boot self-check
-├── VirtualSpeedModel.h/.cpp Flat-road aerodynamic engine & dual-resolution event timers
-├── StatusLed.h/.cpp      Non-blocking visual connection & scan status indicator
-└── TrainerBridge.ino     Firmware entrypoint, GATT services & BLE state machines
-```
-
----
+The host tests run the actual firmware code through scanning, reconnecting 20 times, two
+clients at once, and FTMS success, failure, timeout and late-response cases. They can't test the
+radio, so hardware changes still need a ride on a real trainer:
+[→ docs/testing.md](docs/testing.md). See [CONTRIBUTING.md](CONTRIBUTING.md) and
+[CHANGELOG.md](CHANGELOG.md).
 
 ## License
 
-TrainerBridge is licensed under the GNU General Public License v3.0. See [LICENSE](LICENSE).
+[GPL-3.0](LICENSE)
 
-*TrainerBridge is an independent open-source project and is not affiliated with or endorsed by Garmin, Decathlon, Van Rysel, Zwift, MyWhoosh, or TrainerDay.*
+*TrainerBridge is an independent project, not affiliated with or endorsed by Garmin,
+Decathlon, Van Rysel, Zwift, MyWhoosh or TrainerDay.*

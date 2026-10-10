@@ -28,7 +28,7 @@
  *   - Flywheel coasting deceleration for realistic momentum
  *   - Thread-safe FreeRTOS coalescing command queue
  *   - Non-blocking serial CLI
- *   - Brownout-safe BLE power profile (+6 dBm)
+ *   - +9 dBm BLE TX power (brownout detector disabled for weak USB supplies)
  *   - Deterministic Control Point state machine (zero double-indication violations)
  *   - Value-based BLE address handling (zero heap leaks)
  */
