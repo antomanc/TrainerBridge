@@ -123,7 +123,7 @@ radio, so hardware changes still need a ride on a real trainer:
 
 ## License
 
-[GPL-3.0](LICENSE)
+[GPL-3.0](LICENSE) © 2026 Antonio Mancini
 
 *TrainerBridge is an independent project, not affiliated with or endorsed by Garmin,
 Decathlon, Van Rysel, Zwift, MyWhoosh or TrainerDay.*
