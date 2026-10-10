@@ -24,15 +24,15 @@ bool CommandQueue::push(const uint8_t *data, size_t len, uint8_t opcode, int16_t
   portENTER_CRITICAL(&_mux);
 
   // If opcode is coalescent, search for an existing pending command of the same opcode
+  // from the same client, so every client still receives a response for its command
   if (isCoalescentOpcode(opcode) && _count > 0) {
     for (size_t i = 0; i < _count; i++) {
       size_t idx = (_head + i) % CAPACITY;
-      if (_buffer[idx].opcode == opcode) {
+      if (_buffer[idx].opcode == opcode && _buffer[idx].connHandle == connHandle) {
         // Coalesce in-place with latest parameter values
         memcpy(_buffer[idx].data, data, len);
         _buffer[idx].len = (uint8_t)len;
         _buffer[idx].targetValue = targetValue;
-        _buffer[idx].connHandle = connHandle;
         portEXIT_CRITICAL(&_mux);
         return true;
       }
