@@ -5,6 +5,7 @@
 #include <map>
 #include <memory>
 #include <cstdint>
+#include <functional>
 constexpr int ESP_PWR_LVL_P9=9;
 namespace NIMBLE_PROPERTY { constexpr int READ=1, WRITE=2, NOTIFY=4, INDICATE=8; }
 class NimBLEUUID {
@@ -127,11 +128,16 @@ struct NimBLERemoteCharacteristic {
   bool writable=true,notifiable=true,indicatable=true,subscribeOk=true,writeOk=true;
   RemoteCallback callback=nullptr;
   std::vector<std::vector<uint8_t>> writes;
+  std::function<void()> afterWrite; // Simulates a peer response arriving before writeValue returns.
   bool canWrite() const {return writable;}
   bool canNotify() const {return notifiable;}
   bool canIndicate() const {return indicatable;}
   bool subscribe(bool,RemoteCallback c) {callback=c;return subscribeOk;}
-  bool writeValue(uint8_t* d,size_t n,bool) {writes.push_back({d,d+n});return writeOk;}
+  bool writeValue(uint8_t* d,size_t n,bool) {
+    writes.push_back({d,d+n});
+    if(afterWrite) {auto hook=afterWrite; afterWrite=nullptr; hook();}
+    return writeOk;
+  }
 };
 struct NimBLERemoteService {
   NimBLERemoteCharacteristic data,control;
