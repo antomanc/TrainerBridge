@@ -57,16 +57,24 @@ Host assertions cover:
   execution environment; neither this run nor the mocks validate physical leaks.
 - Hardware checks below: not executed.
 
-## Existing behavior outside this compatibility change
+## FTMS control point fixes (follow-up)
 
-These are not claims of complete FTMS correctness: the queue coalesces by opcode
-across clients, retaining the latest handle; pending trainer commands are cleared
-on trainer disconnect without an immediate failed indication. The initial Request
-Control attempt occurs before `realConnected` is set, and the write helper declines
-it. The response state machine does not compare a received opcode with the pending
-opcode. These pre-existing semantics are unchanged; concurrent controllers,
-out-of-order/late replies and trainer control acquisition require separate work
-if physical tests expose failures. This patch does not change protocol policy.
+The pre-existing control point issues documented with the patch upgrade were fixed
+separately, with host coverage:
+
+- The bridge now actually sends Request Control to the trainer after connecting
+  (the write previously ran before `realConnected` was set and was declined).
+- Trainer responses are matched against the pending opcode; unsolicited or
+  mismatched responses no longer complete the pending transaction.
+- On trainer disconnect, the in-flight and queued commands fail immediately with
+  Operation Failed, each to its originating client.
+- Responses with no originating client (serial CLI commands, or a client that
+  disconnected mid-transaction) are no longer indicated to every connected client.
+- The command queue coalesces only within one client, so every app gets a response.
+
+Still unhandled: a late reply arriving after a timeout *and* after the next command
+with the same opcode was sent is attributed to the newer command; FTMS responses
+carry no sequence number to tell them apart.
 
 ## Physical checks still required
 

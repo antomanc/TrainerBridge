@@ -21,7 +21,7 @@ public:
 
   CommandQueue();
 
-  // Pushes a command to the queue with coalescing for continuous updates (0x11, 0x05, 0x04).
+  // Pushes a command to the queue, coalescing continuous updates (0x11, 0x05, 0x04) from the same client.
   // Thread-safe across ESP32 cores. Returns true on success, false if queue is full.
   bool push(const uint8_t *data, size_t len, uint8_t opcode, int16_t targetValue = 0, uint16_t connHandle = NO_CONN_HANDLE);
 

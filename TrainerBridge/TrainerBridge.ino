@@ -376,16 +376,13 @@ static void sendVirtualControlPointResponse(uint8_t requestedOpcode, uint8_t res
     requestedOpcode, resultCode, connHandle);
 
   virtualControlPointChr->setValue(resp, sizeof(resp));
-  if (connHandle != CommandQueue::NO_CONN_HANDLE)
-  {
-    bool indOk = virtualControlPointChr->indicate(resp, sizeof(resp), connHandle);
-    Serial.printf("[CP INDICATE] connHandle=%d, ok=%d\n", connHandle, indOk ? 1 : 0);
-  }
-  else
-  {
-    bool indOk = virtualControlPointChr->indicate(resp, sizeof(resp));
-    Serial.printf("[CP INDICATE ALL] ok=%d\n", indOk ? 1 : 0);
-  }
+
+  // Responses belong to the requesting client only. Commands from the serial CLI or
+  // from a client that already left have no recipient, so nothing is indicated.
+  if (connHandle == CommandQueue::NO_CONN_HANDLE) return;
+
+  bool indOk = virtualControlPointChr->indicate(resp, sizeof(resp), connHandle);
+  Serial.printf("[CP INDICATE] connHandle=%d, ok=%d\n", connHandle, indOk ? 1 : 0);
 }
 
 // =====================================================
@@ -540,6 +537,14 @@ static void realControlPointCallback(
 
   uint8_t opcode = pData[1];
   uint8_t result = pData[2];
+
+  // Ignore responses that do not belong to the pending transaction
+  // (e.g. the trainer's reply to the Request Control sent at connection time)
+  if (cpTxState == CpTxState::IDLE || opcode != pendingCpOpcode)
+  {
+    LOGLN("Unsolicited real CP response ignored");
+    return;
+  }
 
   // If the command already timed out, do not send a duplicate indication to app
   if (cpTxState == CpTxState::TIMED_OUT)
@@ -757,8 +762,20 @@ class RealClientCallbacks : public NimBLEClientCallbacks
     realIndoorBikeDataChr = nullptr;
     realControlPointChr = nullptr;
 
+    // Fail the in-flight and queued commands so apps do not wait for their own timeout
+    if (cpTxState == CpTxState::WAITING_RESPONSE)
+    {
+      sendVirtualControlPointResponse(pendingCpOpcode, FTMS_CP_RES_OPERATION_FAILED, pendingCpConnHandle);
+    }
     cpTxState = CpTxState::IDLE;
-    commandQueue.clear();
+    pendingCpConnHandle = CommandQueue::NO_CONN_HANDLE;
+
+    QueuedCommand dropped;
+    while (commandQueue.pop(dropped))
+    {
+      sendVirtualControlPointResponse(dropped.opcode, FTMS_CP_RES_OPERATION_FAILED, dropped.connHandle);
+    }
+
     powerFilter.reset();
     virtualSpeedModel.stop(millis());
 
@@ -915,16 +932,18 @@ static bool connectToRealTrainer()
         LOGLN("Subscribe Real Control Point notifications FAILED");
       }
     }
-
-    if (realControlPointChr->canWrite())
-    {
-      uint8_t reqCtrl[1] = {FTMS_CP_OP_REQUEST_CONTROL};
-      writeRealControlPoint(reqCtrl, sizeof(reqCtrl));
-    }
   }
 
   realConnected = true;
   proxyReady = true;
+
+  // Take control of the trainer once; app Request Control writes are answered locally.
+  // Must follow realConnected = true, which writeRealControlPoint requires.
+  if (realControlPointChr != nullptr && realControlPointChr->canWrite())
+  {
+    uint8_t reqCtrl[1] = {FTMS_CP_OP_REQUEST_CONTROL};
+    writeRealControlPoint(reqCtrl, sizeof(reqCtrl));
+  }
 
   LOGLN("Trainer reale connesso. Proxy pronto per Garmin/Zwift/MyWhoosh.");
 

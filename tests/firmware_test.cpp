@@ -55,6 +55,10 @@ int main() {
   assert(realConnected && proxyReady && realClient);
   assert(realIndoorBikeDataChr->callback==realIndoorBikeDataCallback);
   assert(realControlPointChr->callback==realControlPointCallback);
+  // The bridge takes control of the trainer once connected; the reply is not forwarded.
+  assert((realControlPointChr->writes==std::vector<std::vector<uint8_t>>{{FTMS_CP_OP_REQUEST_CONTROL}}));
+  reply(FTMS_CP_OP_REQUEST_CONTROL);
+  assert(virtualControlPointChr->indications.empty() && cpTxState==CpTxState::IDLE);
   proxyServer->connectedCount=2; loop(); assert(!NimBLEDevice::advertising.active);
   proxyServer->connectedCount=1; testNow+=500; loop(); assert(NimBLEDevice::advertising.active);
 
@@ -90,6 +94,9 @@ int main() {
   processQueuedCommands();
   assert(cpTxState==CpTxState::WAITING_RESPONSE);
   assert(realControlPointChr->writes.back()==std::vector<uint8_t>({FTMS_CP_OP_SET_TARGET_POWER,250,0}));
+  auto before=virtualControlPointChr->indications.size();
+  reply(FTMS_CP_OP_START_RESUME); // Mismatched opcode must not complete the transaction.
+  assert(cpTxState==CpTxState::WAITING_RESPONSE && virtualControlPointChr->indications.size()==before);
   auto statuses=virtualStatusChr->notifications.size();
   reply(FTMS_CP_OP_SET_TARGET_POWER);
   assertCp(FTMS_CP_OP_SET_TARGET_POWER,FTMS_CP_RES_SUCCESS,22);
@@ -121,6 +128,12 @@ int main() {
   static_cast<NimBLEServerCallbacks*>(&proxyServerCallbacks)->onDisconnect(proxyServer,departing,19);
   reply(FTMS_CP_OP_SET_TARGET_POWER);
   assert(virtualControlPointChr->indications.size()==indications);
+  // A departing app's timeout is not broadcast to the remaining clients.
+  writeCp({FTMS_CP_OP_SET_TARGET_POWER,160,0}); processQueuedCommands();
+  static_cast<NimBLEServerCallbacks*>(&proxyServerCallbacks)->onDisconnect(proxyServer,departing,19);
+  testNow+=CP_TIMEOUT_MS+1; processQueuedCommands();
+  assert(virtualControlPointChr->indications.size()==indications && cpTxState==CpTxState::TIMED_OUT);
+  reply(FTMS_CP_OP_SET_TARGET_POWER);
 
   // Repeat disconnect -> delayed scan -> rediscovery -> reconnect, keeping the same host/client.
   auto* client=realClient;
@@ -128,10 +141,15 @@ int main() {
     writeCp({FTMS_CP_OP_SET_TARGET_POWER,180,0});
     processQueuedCommands();
     assert(cpTxState==CpTxState::WAITING_RESPONSE);
-    writeCp({FTMS_CP_OP_STOP_PAUSE,1});
+    writeCp({FTMS_CP_OP_STOP_PAUSE,1},22);
     assert(!commandQueue.isEmpty());
     clearDeliveries();
     disconnectTrainer();
+    // In-flight and queued commands fail immediately, each to its originating client.
+    assert(virtualControlPointChr->indications.size()==2);
+    assert((virtualControlPointChr->indications[0].bytes==std::vector<uint8_t>{FTMS_CP_OP_RESPONSE_CODE,FTMS_CP_OP_SET_TARGET_POWER,FTMS_CP_RES_OPERATION_FAILED}));
+    assert(virtualControlPointChr->indications[0].handle==11);
+    assertCp(FTMS_CP_OP_STOP_PAUSE,FTMS_CP_RES_OPERATION_FAILED,22);
     assert(!realConnected && !proxyReady && !realIndoorBikeDataChr && !realControlPointChr);
     assert(commandQueue.isEmpty() && cpTxState==CpTxState::IDLE);
     assert(powerFilter.getLastOutput()==0 && virtualSpeedModel.getSpeedMps()==0);
@@ -150,9 +168,11 @@ int main() {
   CommandQueue queue;
   uint8_t command[]={FTMS_CP_OP_SET_TARGET_POWER,1,0};
   assert(queue.push(command,3,command[0],1,11));
-  command[1]=2; assert(queue.push(command,3,command[0],2,22));
-  QueuedCommand out{}; assert(queue.count()==1 && queue.pop(out));
-  assert(out.targetValue==2 && out.connHandle==22); // Existing cross-client coalescing behavior.
+  command[1]=2; assert(queue.push(command,3,command[0],2,11));
+  command[1]=3; assert(queue.push(command,3,command[0],3,22));
+  QueuedCommand out{}; assert(queue.count()==2 && queue.pop(out));
+  assert(out.targetValue==2 && out.connHandle==11); // Coalesces only within one client.
+  assert(queue.pop(out) && out.targetValue==3 && out.connHandle==22);
   assert(!queue.push(nullptr,3,command[0]));
   assert(!queue.push(command,21,command[0]));
   // Failed reconnect and failed telemetry subscription return to the scan retry path.
