@@ -118,15 +118,14 @@ static NimBLECharacteristic *virtualStatusChr = nullptr;
 
 static bool proxyAdvertisingStartedOnce = false;
 
-// Control Point transaction tracking
+// Control Point transaction tracking.
+// Shared by loop() and the NimBLE host task: read and transition it only inside
+// cpTxMux, and make BLE/Serial calls after leaving the critical section.
+static portMUX_TYPE cpTxMux = portMUX_INITIALIZER_UNLOCKED;
 static volatile CpTxState cpTxState = CpTxState::IDLE;
-static uint8_t pendingCpOpcode = 0x00;
-static uint16_t pendingCpConnHandle = CommandQueue::NO_CONN_HANDLE;
+static QueuedCommand pendingCp = {};
 static unsigned long pendingCpSince = 0;
-static int16_t pendingTargetPower = 0;
 static int16_t activeTargetPower = 0;
-static uint8_t pendingSimCommandData[CommandQueue::MAX_PAYLOAD_LEN];
-static size_t pendingSimCommandLen = 0;
 
 // Packet counters and diagnostics
 static uint32_t packetsFromTrainer = 0;
@@ -538,60 +537,67 @@ static void realControlPointCallback(
   uint8_t opcode = pData[1];
   uint8_t result = pData[2];
 
-  // Ignore responses that do not belong to the pending transaction
-  // (e.g. the trainer's reply to the Request Control sent at connection time)
-  if (cpTxState == CpTxState::IDLE || opcode != pendingCpOpcode)
+  // Claim the pending transaction if this response belongs to it. Responses with
+  // another opcode (e.g. the reply to the Request Control sent at connection time)
+  // are ignored.
+  QueuedCommand completed;
+  bool matches = false;
+  bool timedOut = false;
+  portENTER_CRITICAL(&cpTxMux);
+  if (cpTxState != CpTxState::IDLE && opcode == pendingCp.opcode)
+  {
+    matches = true;
+    timedOut = cpTxState == CpTxState::TIMED_OUT;
+    completed = pendingCp;
+    cpTxState = CpTxState::IDLE;
+  }
+  portEXIT_CRITICAL(&cpTxMux);
+
+  if (!matches)
   {
     LOGLN("Unsolicited real CP response ignored");
     return;
   }
 
   // If the command already timed out, do not send a duplicate indication to app
-  if (cpTxState == CpTxState::TIMED_OUT)
+  if (timedOut)
   {
     LOGLN("Late real CP indication dropped after timeout");
-    cpTxState = CpTxState::IDLE;
     return;
   }
 
-  if (cpTxState == CpTxState::WAITING_RESPONSE)
+  // Forward the real trainer's confirmation only to the client that sent the command
+  if (virtualControlPointChr != nullptr)
   {
-    cpTxState = CpTxState::IDLE;
+    Serial.printf("[REAL CP RESP] opcode=0x%02X, res=0x%02X, targetConnHandle=%d\n",
+      opcode, result, completed.connHandle);
 
-    // Forward the real trainer's confirmation only to the client that sent the command
-    if (virtualControlPointChr != nullptr)
+    virtualControlPointChr->setValue(pData, length);
+    if (completed.connHandle != CommandQueue::NO_CONN_HANDLE)
     {
-      Serial.printf("[REAL CP RESP] opcode=0x%02X, res=0x%02X, targetConnHandle=%d\n",
-        opcode, result, pendingCpConnHandle);
-
-      virtualControlPointChr->setValue(pData, length);
-      if (pendingCpConnHandle != CommandQueue::NO_CONN_HANDLE)
-      {
-        virtualControlPointChr->indicate(pData, length, pendingCpConnHandle);
-      }
+      virtualControlPointChr->indicate(pData, length, completed.connHandle);
     }
-    pendingCpConnHandle = CommandQueue::NO_CONN_HANDLE;
+  }
 
-    // Emit status notifications ONLY after real trainer confirms success
-    if (result == FTMS_CP_RES_SUCCESS)
+  // Emit status notifications ONLY after real trainer confirms success
+  if (result == FTMS_CP_RES_SUCCESS)
+  {
+    if (opcode == FTMS_CP_OP_SET_TARGET_POWER)
     {
-      if (opcode == FTMS_CP_OP_SET_TARGET_POWER)
-      {
-        activeTargetPower = pendingTargetPower;
-        notifyFtmsStatusNewPower(activeTargetPower);
-      }
-      else if (opcode == FTMS_CP_OP_SET_INDOOR_BIKE_SIM && pendingSimCommandLen >= 7)
-      {
-        notifyFtmsStatusIndoorSimulation(pendingSimCommandData, pendingSimCommandLen);
-      }
-      else if (opcode == FTMS_CP_OP_START_RESUME)
-      {
-        notifyFtmsStatusStarted();
-      }
-      else if (opcode == FTMS_CP_OP_STOP_PAUSE)
-      {
-        notifyFtmsStatusStopped();
-      }
+      activeTargetPower = completed.targetValue;
+      notifyFtmsStatusNewPower(activeTargetPower);
+    }
+    else if (opcode == FTMS_CP_OP_SET_INDOOR_BIKE_SIM && completed.len >= 7)
+    {
+      notifyFtmsStatusIndoorSimulation(completed.data, completed.len);
+    }
+    else if (opcode == FTMS_CP_OP_START_RESUME)
+    {
+      notifyFtmsStatusStarted();
+    }
+    else if (opcode == FTMS_CP_OP_STOP_PAUSE)
+    {
+      notifyFtmsStatusStopped();
     }
   }
 }
@@ -644,6 +650,9 @@ class VirtualControlPointCallbacks : public NimBLECharacteristicCallbacks
     {
       sendVirtualControlPointResponse(opcode, FTMS_CP_RES_SUCCESS, clientConnHandle);
       notifyFtmsStatusStarted();
+      // Also start the real trainer, from loop() (writing here would block the host task).
+      // It has no originating client: the app already has its response.
+      commandQueue.push(cmd, len, opcode);
       return;
     }
 
@@ -725,10 +734,12 @@ class ProxyServerCallbacks : public NimBLEServerCallbacks
       reason,
       server->getConnectedCount());
 
-    if (pendingCpConnHandle == connInfo.getConnHandle())
+    portENTER_CRITICAL(&cpTxMux);
+    if (pendingCp.connHandle == connInfo.getConnHandle())
     {
-      pendingCpConnHandle = CommandQueue::NO_CONN_HANDLE;
+      pendingCp.connHandle = CommandQueue::NO_CONN_HANDLE;
     }
+    portEXIT_CRITICAL(&cpTxMux);
   }
 
   void onMTUChange(uint16_t MTU, NimBLEConnInfo &connInfo) override
@@ -763,12 +774,17 @@ class RealClientCallbacks : public NimBLEClientCallbacks
     realControlPointChr = nullptr;
 
     // Fail the in-flight and queued commands so apps do not wait for their own timeout
-    if (cpTxState == CpTxState::WAITING_RESPONSE)
-    {
-      sendVirtualControlPointResponse(pendingCpOpcode, FTMS_CP_RES_OPERATION_FAILED, pendingCpConnHandle);
-    }
+    portENTER_CRITICAL(&cpTxMux);
+    bool wasWaiting = cpTxState == CpTxState::WAITING_RESPONSE;
+    QueuedCommand inFlight = pendingCp;
     cpTxState = CpTxState::IDLE;
-    pendingCpConnHandle = CommandQueue::NO_CONN_HANDLE;
+    pendingCp.connHandle = CommandQueue::NO_CONN_HANDLE;
+    portEXIT_CRITICAL(&cpTxMux);
+
+    if (wasWaiting)
+    {
+      sendVirtualControlPointResponse(inFlight.opcode, FTMS_CP_RES_OPERATION_FAILED, inFlight.connHandle);
+    }
 
     QueuedCommand dropped;
     while (commandQueue.pop(dropped))
@@ -1294,15 +1310,26 @@ static void setupScanner()
 
 static void processQueuedCommands()
 {
+  const unsigned long now = millis();
+
   // If an acknowledged command is currently awaiting confirmation from the real trainer
-  if (cpTxState == CpTxState::WAITING_RESPONSE)
+  portENTER_CRITICAL(&cpTxMux);
+  bool waiting = cpTxState == CpTxState::WAITING_RESPONSE;
+  bool timedOut = waiting && now - pendingCpSince > CP_TIMEOUT_MS;
+  QueuedCommand expired = pendingCp;
+  if (timedOut)
   {
-    if (millis() - pendingCpSince > CP_TIMEOUT_MS)
+    cpTxState = CpTxState::TIMED_OUT;
+    pendingCp.connHandle = CommandQueue::NO_CONN_HANDLE;
+  }
+  portEXIT_CRITICAL(&cpTxMux);
+
+  if (waiting)
+  {
+    if (timedOut)
     {
       LOGLN("Control Point transaction timeout");
-      cpTxState = CpTxState::TIMED_OUT;
-      sendVirtualControlPointResponse(pendingCpOpcode, FTMS_CP_RES_OPERATION_FAILED, pendingCpConnHandle);
-      pendingCpConnHandle = CommandQueue::NO_CONN_HANDLE;
+      sendVirtualControlPointResponse(expired.opcode, FTMS_CP_RES_OPERATION_FAILED, expired.connHandle);
     }
     return;
   }
@@ -1320,28 +1347,27 @@ static void processQueuedCommands()
     return;
   }
 
-  if (cmd.opcode == FTMS_CP_OP_SET_TARGET_POWER)
-  {
-    pendingTargetPower = cmd.targetValue;
-  }
-  else if (cmd.opcode == FTMS_CP_OP_SET_INDOOR_BIKE_SIM)
-  {
-    pendingSimCommandLen = cmd.len;
-    memcpy(pendingSimCommandData, cmd.data, cmd.len);
-  }
+  // Start waiting before the write: the trainer's response is delivered on the
+  // host task and can arrive before writeValue returns.
+  portENTER_CRITICAL(&cpTxMux);
+  cpTxState = CpTxState::WAITING_RESPONSE;
+  pendingCp = cmd;
+  pendingCpSince = now;
+  portEXIT_CRITICAL(&cpTxMux);
 
   bool ok = writeRealControlPoint(cmd.data, cmd.len);
 
   if (!ok)
   {
-    sendVirtualControlPointResponse(cmd.opcode, FTMS_CP_RES_OPERATION_FAILED, cmd.connHandle);
-    return;
-  }
+    portENTER_CRITICAL(&cpTxMux);
+    if (cpTxState == CpTxState::WAITING_RESPONSE && pendingCp.opcode == cmd.opcode)
+    {
+      cpTxState = CpTxState::IDLE;
+    }
+    portEXIT_CRITICAL(&cpTxMux);
 
-  cpTxState = CpTxState::WAITING_RESPONSE;
-  pendingCpOpcode = cmd.opcode;
-  pendingCpConnHandle = cmd.connHandle;
-  pendingCpSince = millis();
+    sendVirtualControlPointResponse(cmd.opcode, FTMS_CP_RES_OPERATION_FAILED, cmd.connHandle);
+  }
 }
 
 // =====================================================
