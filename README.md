@@ -66,8 +66,8 @@ $$P_{\text{wheel}} = \left(C_{\text{rr}} \cdot m_{\text{total}} \cdot g\right) v
 
 ## Requirements
 
-- ESP32 Arduino core **3.3.10**
-- [NimBLE-Arduino](https://github.com/h2zero/NimBLE-Arduino) **2.5.0**
+- ESP32 Arduino core **3.3.12**
+- [NimBLE-Arduino](https://github.com/h2zero/NimBLE-Arduino) **2.5.1**
 - Arduino CLI or Arduino IDE
 
 ---
@@ -103,14 +103,14 @@ When operating headless without a serial monitor, the onboard LED provides immed
 
 ## Build and Flash
 
-Install dependencies and compile with zero warnings:
+Install the pinned dependencies and compile with all warnings enabled:
 
 ```bash
 arduino-cli core update-index \
   --additional-urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
-arduino-cli core install esp32:esp32@3.3.10 \
+arduino-cli core install esp32:esp32@3.3.12 \
   --additional-urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
-arduino-cli lib install NimBLE-Arduino@2.5.0
+arduino-cli lib install NimBLE-Arduino@2.5.1
 arduino-cli compile --warnings all --fqbn esp32:esp32:esp32 TrainerBridge
 ```
 
@@ -119,6 +119,26 @@ Upload to a connected ESP32:
 ```bash
 arduino-cli upload --port /dev/ttyUSB0 --fqbn esp32:esp32:esp32 TrainerBridge
 ```
+
+---
+
+## Software Checks and Hardware Validation
+
+Run the host regression harness with a C++17 compiler:
+
+```bash
+bash tests/run.sh
+```
+
+The harness executes the firmware callbacks and loop with Arduino/NimBLE test doubles,
+including the existing module self-checks, scan retry timing, repeated reconnects,
+multi-client telemetry routing, and FTMS transactions. CI also compiles against the
+real pinned libraries with `--warnings all`. Test doubles do not validate the BLE
+stack, FreeRTOS concurrency, radio delivery, or scan-response timer lifetime.
+
+See [the patch upgrade validation notes](tests/VALIDATION.md) for coverage, known
+limitations, and the physical ESP32/trainer/Garmin/app checks still required for
+ESP32 Arduino 3.3.12 and NimBLE-Arduino 2.5.1.
 
 ---
 
